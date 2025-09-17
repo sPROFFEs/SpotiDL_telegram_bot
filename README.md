@@ -18,6 +18,9 @@ A Telegram bot for downloading Spotify playlists to your Navidrome server with i
 - Custom folder naming for organized storage
 - Automatic playlist updates with new songs
 - Manual sync functionality
+- Individual track addition from Spotify search or URL
+- Custom playlist creation for single tracks
+- Smart sync exclusion for custom playlists
 
 ### 🔍 **Integrity Checking**
 - Verify downloaded song completeness
@@ -30,6 +33,8 @@ A Telegram bot for downloading Spotify playlists to your Navidrome server with i
 - Delete individual songs with confirmation
 - File existence verification
 - Duplicate prevention system
+- Enhanced deletion confirmations with detailed feedback
+- Improved playlist and song browsing interface
 
 ### 🛡️ **Reliability Features**
 - Multi-layer download strategy (direct, proxy, HTTP fallback)
@@ -37,6 +42,9 @@ A Telegram bot for downloading Spotify playlists to your Navidrome server with i
 - Rate limiting to prevent API overload
 - SSL certificate error handling
 - Database backup and corruption recovery
+- Enhanced Spotify token acquisition with browser simulation
+- Robust callback data parsing for complex playlist IDs
+- Improved error handling and user feedback
 
 ## 📁 **File Structure**
 
@@ -112,6 +120,8 @@ python3 bot_spot.py
 - `/start` - Show main menu
 - `/settings` - Configure bot settings
 - `/sync` - Manual playlist synchronization
+- `/track` - Add individual tracks from Spotify URL
+- `/search` - Search songs in your downloaded library
 
 ### **Main Features**
 
@@ -120,6 +130,14 @@ python3 bot_spot.py
 2. Send Spotify playlist URL
 3. Choose folder name
 4. Confirm download
+
+#### **🎵 Add Individual Tracks**
+1. Click "➕ Add Track" or use `/track <spotify_url>`
+2. **Search Method**: Search Spotify directly with song/artist name
+3. **URL Method**: Paste a Spotify track URL
+4. Select from search results or confirm URL track
+5. Choose existing playlist or create a new one
+6. Track is downloaded to the selected playlist
 
 #### **🔍 Integrity Checking**
 - **Individual**: Click "🔍 Check Integrity" on any playlist
@@ -136,6 +154,13 @@ Configure automatic playlist updates:
 - Enable/disable auto-sync
 - Set sync day and time
 - Toggle sync notifications
+- **Smart Sync**: Only syncs Spotify playlists (excludes custom playlists)
+- **Detailed Reporting**: Shows total, syncable, and custom playlist counts
+
+#### **🔍 Library Search**
+- Use `/search <query>` to find downloaded songs
+- Search by song title, artist, or playlist name
+- Quick access to your entire music library
 
 ## 🔧 **Configuration**
 
@@ -165,6 +190,8 @@ Configure automatic playlist updates:
 - **Database**: JSON-based storage with automatic backups
 - **Integrity Checking**: File size, duration, and header validation
 - **Error Recovery**: Multi-layer fallback strategies
+- **Spotify Integration**: Direct API access with browser-simulated token acquisition
+- **Playlist Types**: Distinguishes between Spotify playlists and custom playlists
 
 ### **Download Strategy**
 1. **Direct Connection** - Primary method
@@ -178,6 +205,9 @@ Configure automatic playlist updates:
 - Rate limiting to prevent blocking
 - Automatic duplicate prevention
 - Database corruption recovery
+- Enhanced error handling with user-friendly messages
+- Robust callback data parsing for complex operations
+- Automatic sync exclusion for non-syncable playlists
 
 ## 📊 **Monitoring**
 
@@ -190,6 +220,9 @@ Configure automatic playlist updates:
 - **HTTP 500 errors**: Server overload - bot will retry automatically
 - **SSL errors**: Proxy issues - bot will switch to direct connection
 - **Timeouts**: Network issues - bot will retry with longer timeouts
+- **Spotify Token Issues**: Automatic token refresh with browser simulation
+- **Playlist Not Found**: Check if playlist ID parsing is working correctly
+- **Sync Exclusions**: Custom playlists are automatically excluded from sync operations
 
 ## 🤝 **Contributing**
 

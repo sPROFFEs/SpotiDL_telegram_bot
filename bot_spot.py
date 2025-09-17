@@ -73,6 +73,88 @@ download_logger.addHandler(download_handler)
 download_logger.setLevel(logging.INFO)
 
 # --- HELPER FUNCTIONS ---
+def escape_markdown(text) -> str:
+    """Escape markdown special characters for Telegram"""
+    if text is None:
+        return 'Unknown'
+
+    text_str = str(text)
+
+    # First handle any problematic Unicode characters by normalizing them
+    try:
+        import unicodedata
+        # Normalize unicode characters and ensure proper UTF-8 encoding
+        text_str = unicodedata.normalize('NFKC', text_str)
+        text_str = text_str.encode('utf-8', errors='replace').decode('utf-8')
+
+        # Replace potentially problematic characters that cause Telegram parsing issues
+        replacements = {
+            'ø': 'o',
+            'Ø': 'O',
+            'ł': 'l',
+            'Ł': 'L',
+            'đ': 'd',
+            'Đ': 'D',
+            'ß': 'ss',
+            # Keep most accented characters as they usually work fine
+        }
+
+        for old, new in replacements.items():
+            text_str = text_str.replace(old, new)
+
+    except (UnicodeEncodeError, UnicodeDecodeError, ImportError):
+        # If there are encoding issues, replace problematic characters
+        text_str = str(text).encode('ascii', errors='replace').decode('ascii')
+
+    # Then escape markdown special characters that are used by Telegram markdown
+    # Order matters - do backslash first to avoid double escaping
+    text_str = text_str.replace('\\', '\\\\')
+    text_str = text_str.replace('*', '\\*')
+    text_str = text_str.replace('_', '\\_')
+    text_str = text_str.replace('[', '\\[')
+    text_str = text_str.replace(']', '\\]')
+    text_str = text_str.replace('`', '\\`')
+    text_str = text_str.replace('~', '\\~')
+
+    # Also escape parentheses that can cause issues in some contexts
+    text_str = text_str.replace('(', '\\(')
+    text_str = text_str.replace(')', '\\)')
+
+    return text_str
+
+def normalize_track_info(track_info: dict) -> dict:
+    """Normalize track info to have consistent format"""
+    # Safely get values and ensure they are strings
+    title = str(track_info.get('title', 'Unknown')) if track_info.get('title') else 'Unknown'
+    artist = str(track_info.get('artist', 'Unknown')) if track_info.get('artist') else 'Unknown'
+    album = str(track_info.get('album', title)) if track_info.get('album') else title
+    thumbnail = str(track_info.get('thumbnail', '')) if track_info.get('thumbnail') else ''
+    url = str(track_info.get('url', '')) if track_info.get('url') else ''
+    preview_url = str(track_info.get('previewUrl', '')) if track_info.get('previewUrl') else ''
+
+    # Handle duration conversion from milliseconds to m:ss format
+    duration = '0:00'
+    if track_info.get('duration_ms'):
+        try:
+            total_seconds = int(track_info['duration_ms']) // 1000
+            minutes = total_seconds // 60
+            seconds = total_seconds % 60
+            duration = f"{minutes}:{seconds:02d}"
+        except (ValueError, TypeError):
+            duration = '0:00'
+    elif track_info.get('duration'):
+        duration = str(track_info['duration'])
+
+    return {
+        'title': title,
+        'artist': artist,
+        'album': album,
+        'thumbnail': thumbnail,
+        'url': url,
+        'duration': duration,
+        'previewUrl': preview_url
+    }
+
 def setup_database():
     MUSIC_DIR.mkdir(parents=True, exist_ok=True)
     if not DB_FILE.exists():
@@ -475,16 +557,29 @@ class PlaylistSyncManager:
                 sync_logger.info("No playlists to sync")
                 return
 
-            total_playlists = len(db)
+            # Count only syncable playlists (those with URLs and not custom)
+            syncable_playlists = [
+                (pid, pdata) for pid, pdata in db.items()
+                if pdata.get('url') and not pdata.get('is_custom', False)
+            ]
+            total_playlists = len(syncable_playlists)
+            total_in_db = len(db)
+            custom_playlists = total_in_db - total_playlists
             synced_count = 0
             error_count = 0
             new_songs_count = 0
 
-            sync_logger.info(f"Found {total_playlists} playlists to sync")
+            sync_logger.info(f"Found {total_in_db} total playlists, {total_playlists} syncable (excluding custom playlists)")
 
             for playlist_id, playlist_data in db.items():
                 playlist_name = playlist_data.get('name', 'Unknown')
                 playlist_url = playlist_data.get('url', '')
+                is_custom = playlist_data.get('is_custom', False)
+
+                # Skip custom playlists without URL (created from individual tracks)
+                if is_custom or not playlist_url:
+                    sync_logger.info(f"Skipping custom playlist without URL: {playlist_name}")
+                    continue
 
                 sync_logger.info(f"Syncing playlist: {playlist_name}")
 
@@ -558,7 +653,9 @@ class PlaylistSyncManager:
                 'synced': synced_count,
                 'total': total_playlists,
                 'new_songs': new_songs_count,
-                'errors': error_count
+                'errors': error_count,
+                'total_in_db': total_in_db,
+                'custom_playlists': custom_playlists
             }
 
         except Exception as e:
@@ -691,6 +788,1258 @@ class SpotDownAPI:
             download_logger.warning(f"HTTP fallback method failed: {e}")
             return False
 
+    async def get_track_details(self, track_url: str):
+        """Get details for a single Spotify track"""
+        # Ensure it's a track URL, not playlist
+        if "open.spotify.com/track/" not in track_url:
+            return None
+
+        api_url = f"{self.BASE_URL}/api/song-details?url={quote(track_url)}"
+
+        try:
+            async with async_playwright() as p:
+                try:
+                    browser = await p.chromium.launch(**self.BROWSER_LAUNCH_OPTIONS)
+                except Exception as e:
+                    download_logger.error(f"Failed to start Playwright: {e}")
+                    return None
+
+                page = await browser.new_page()
+                await page.set_extra_http_headers(self.COMMON_HEADERS)
+
+                try:
+                    response = await page.goto(api_url, wait_until='networkidle', timeout=30000)
+
+                    if response and response.status == 200:
+                        content = await page.content()
+                        if "songs" in content:
+                            json_data = await response.json()
+                            await browser.close()
+
+                            # For single tracks, we expect just one song in the response
+                            if json_data and "songs" in json_data and len(json_data["songs"]) > 0:
+                                track_info = json_data["songs"][0]
+                                return {
+                                    "title": track_info.get("title", "Unknown"),
+                                    "artist": track_info.get("artist", "Unknown"),
+                                    "url": track_url,
+                                    "download_url": track_info.get("url", "")
+                                }
+
+                    await browser.close()
+                    return None
+
+                except Exception as e:
+                    await browser.close()
+                    download_logger.error(f"Error getting track details: {e}")
+                    return None
+
+        except Exception as e:
+            download_logger.error(f"Failed to get track details: {e}")
+            return None
+
+    async def get_track_details_advanced(self, track_url: str, tokens: dict = None):
+        """Get detailed track information using Spotify's real API flow"""
+        try:
+            # Extract track ID from URL
+            if '/track/' not in track_url:
+                return None
+
+            track_id = track_url.split('/track/')[-1].split('?')[0]
+            track_uri = f"spotify:track:{track_id}"
+
+            # If we don't have tokens, get them first
+            if not tokens:
+                tokens = await self._get_spotify_tokens()
+
+            if not tokens or not tokens.get('auth_token'):
+                download_logger.warning("No tokens available for advanced track details")
+                return await self.get_track_details(track_url)
+
+            import aiohttp
+
+            # GraphQL query for track details
+            payload = {
+                "variables": {
+                    "uri": track_uri
+                },
+                "operationName": "getTrack",
+                "extensions": {
+                    "persistedQuery": {
+                        "version": 1,
+                        "sha256Hash": "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294"
+                    }
+                }
+            }
+
+            headers = {
+                'Authorization': f'Bearer {tokens.get("auth_token", "")}',
+                'Client-Token': tokens.get('client_token', ''),
+                'Content-Type': 'application/json;charset=UTF-8',
+                'Accept': 'application/json',
+                'Accept-Language': 'en',
+                'Origin': 'https://open.spotify.com',
+                'Referer': 'https://open.spotify.com/',
+                'User-Agent': self.COMMON_HEADERS['User-Agent'],
+                'Sec-Fetch-Site': 'same-site',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Dest': 'empty'
+            }
+
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    'https://api-partner.spotify.com/pathfinder/v2/query',
+                    json=payload,
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return self._extract_track_details_from_response(data, track_url)
+                    else:
+                        download_logger.warning(f"Advanced track details failed with status: {response.status}")
+                        return await self.get_track_details(track_url)
+
+        except Exception as e:
+            download_logger.error(f"Error getting advanced track details: {e}")
+            return await self.get_track_details(track_url)
+
+    def _extract_track_details_from_response(self, data: dict, track_url: str):
+        """Extract track details from advanced API response"""
+        try:
+            track_data = data.get('data', {}).get('trackUnion', {})
+
+            if track_data.get('__typename') == 'Track':
+                title = track_data.get('name', 'Unknown')
+
+                # Extract artists
+                artists = track_data.get('artists', {}).get('items', [])
+                artist_names = []
+                for artist in artists:
+                    profile = artist.get('profile', {})
+                    if 'name' in profile:
+                        artist_names.append(profile['name'])
+
+                artist = ', '.join(artist_names) if artist_names else 'Unknown'
+
+                # Extract album info
+                album = track_data.get('albumOfTrack', {})
+                album_name = album.get('name', '')
+
+                # Extract thumbnail from album cover art
+                thumbnail = ''
+                cover_art = album.get('coverArt', {})
+                if cover_art:
+                    sources = cover_art.get('sources', [])
+                    if sources:
+                        # Get the largest image available
+                        largest_image = max(sources, key=lambda x: x.get('width', 0) * x.get('height', 0))
+                        thumbnail = largest_image.get('url', '')
+
+                # Extract additional metadata
+                duration = track_data.get('duration', {}).get('totalMilliseconds', 0)
+                explicit = track_data.get('contentRating', {}).get('label') == 'EXPLICIT'
+
+                return {
+                    'title': title,
+                    'artist': artist,
+                    'url': track_url,
+                    'album': album_name,
+                    'thumbnail': thumbnail,
+                    'duration_ms': duration,
+                    'explicit': explicit,
+                    'download_url': ''  # Will be filled by the download process
+                }
+
+        except Exception as e:
+            download_logger.error(f"Error parsing advanced track details: {e}")
+
+        # Fallback to basic track info
+        return {
+            'title': 'Unknown',
+            'artist': 'Unknown',
+            'url': track_url,
+            'download_url': ''
+        }
+
+    async def _get_spotify_tokens(self):
+        """Get Spotify tokens by visiting the site"""
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(**self.BROWSER_LAUNCH_OPTIONS)
+                page = await browser.new_page()
+
+                captured_tokens = {}
+                requests_seen = []
+
+                # Simple request interceptor that doesn't block
+                async def simple_intercept(route):
+                    try:
+                        request = route.request
+                        url = request.url
+                        headers = request.headers
+
+                        # Log important requests
+                        if any(endpoint in url for endpoint in ['spotify.com', 'clienttoken.spotify.com']):
+                            requests_seen.append(url)
+                            download_logger.info(f"🔍 Intercepted: {url}")
+
+                            # Capture tokens from request headers (non-blocking)
+                            if any(endpoint in url for endpoint in ['api-partner.spotify.com', 'spclient.wg.spotify.com']):
+                                auth_header = headers.get('authorization', '')
+                                client_header = headers.get('client-token', '')
+
+                                if auth_header and 'Bearer' in auth_header:
+                                    captured_tokens['auth_token'] = auth_header.replace('Bearer ', '')
+                                    download_logger.info(f"🎯 Got auth token from headers!")
+
+                                if client_header:
+                                    captured_tokens['client_token'] = client_header
+                                    download_logger.info(f"🎯 Got client token from headers!")
+
+                        # Continue request without blocking
+                        await route.continue_()
+
+                    except Exception as e:
+                        download_logger.warning(f"Intercept error: {e}")
+                        try:
+                            await route.continue_()
+                        except:
+                            pass
+
+                await page.route("**/*", simple_intercept)
+
+                # Visit Spotify main page
+                download_logger.info("Playwright: Visiting Spotify main page")
+                await page.goto('https://open.spotify.com/', wait_until='domcontentloaded', timeout=15000)
+                await page.wait_for_timeout(1000)
+
+                # Wait for initial load and check for tokens already captured
+                await page.wait_for_timeout(2000)
+                download_logger.info(f"After initial load - tokens captured: auth={bool(captured_tokens.get('auth_token'))}, client={bool(captured_tokens.get('client_token'))}")
+
+                # If we don't have tokens yet, try to trigger API calls with navigation
+                if not captured_tokens.get('auth_token'):
+                    try:
+                        download_logger.info("Playwright: Navigating to search to trigger API calls")
+                        # Direct navigation to search page to trigger token generation
+                        await page.goto('https://open.spotify.com/search/eminem', timeout=15000)
+                        await page.wait_for_timeout(3000)
+
+                        download_logger.info(f"After search navigation - tokens captured: auth={bool(captured_tokens.get('auth_token'))}, client={bool(captured_tokens.get('client_token'))}")
+
+                    except Exception as e:
+                        download_logger.warning(f"Search navigation failed: {e}")
+
+                # If still no tokens, try one more approach
+                if not captured_tokens.get('auth_token'):
+                    try:
+                        download_logger.info("Playwright: Trying to trigger token generation with page reload")
+                        await page.reload(timeout=10000)
+                        await page.wait_for_timeout(2000)
+
+                    except Exception as e:
+                        download_logger.warning(f"Page reload failed: {e}")
+
+                # Extract tokens from page context if not captured from requests
+                if not captured_tokens.get('auth_token'):
+                    try:
+                        download_logger.info("Playwright: Extracting tokens from page context")
+
+                        # Try to get tokens from localStorage or window object
+                        tokens_from_page = await page.evaluate("""
+                            () => {
+                                const result = {};
+
+                                // Try localStorage
+                                try {
+                                    const stored = localStorage.getItem('spotify-token') || localStorage.getItem('accessToken');
+                                    if (stored) result.from_storage = stored;
+                                } catch(e) {}
+
+                                // Try window object
+                                try {
+                                    if (window.Spotify && window.Spotify.token) result.from_window = window.Spotify.token;
+                                    if (window.accessToken) result.from_window_direct = window.accessToken;
+                                } catch(e) {}
+
+                                // Try to find in script tags
+                                try {
+                                    const scripts = document.querySelectorAll('script');
+                                    for (let script of scripts) {
+                                        const content = script.textContent || script.innerHTML;
+                                        const tokenMatch = content.match(/"accessToken":"(BQ[^"]+)"/);
+                                        if (tokenMatch) {
+                                            result.from_script = tokenMatch[1];
+                                            break;
+                                        }
+                                    }
+                                } catch(e) {}
+
+                                return result;
+                            }
+                        """)
+
+                        download_logger.info(f"Playwright: Tokens from page: {tokens_from_page}")
+
+                        # Use any token found
+                        if tokens_from_page.get('from_script'):
+                            captured_tokens['auth_token'] = tokens_from_page['from_script']
+                        elif tokens_from_page.get('from_storage'):
+                            captured_tokens['auth_token'] = tokens_from_page['from_storage']
+                        elif tokens_from_page.get('from_window'):
+                            captured_tokens['auth_token'] = tokens_from_page['from_window']
+                        elif tokens_from_page.get('from_window_direct'):
+                            captured_tokens['auth_token'] = tokens_from_page['from_window_direct']
+
+                    except Exception as e:
+                        download_logger.warning(f"Playwright: Could not extract tokens from page: {e}")
+
+                download_logger.info(f"Playwright: Captured tokens: {bool(captured_tokens.get('auth_token'))}, {bool(captured_tokens.get('client_token'))}")
+                download_logger.info(f"Playwright: Requests seen: {len(requests_seen)}")
+
+                await browser.close()
+                return captured_tokens
+
+        except Exception as e:
+            download_logger.error(f"Error getting Spotify tokens: {e}")
+            return {}
+
+    async def search_spotify_tracks(self, query: str, limit: int = 10):
+        """Search for tracks on Spotify using direct API call"""
+        try:
+            # Try direct API call with fixed tokens first
+            return await self._direct_spotify_api_search(query, limit)
+        except Exception as e:
+            download_logger.error(f"Direct API search failed: {e}")
+            # Fallback to browser simulation
+            try:
+                return await self._simple_spotify_search(query, limit)
+            except Exception as e2:
+                download_logger.error(f"Browser search also failed: {e2}")
+                # Final fallback to HTML scraping
+                return await self._fallback_search(query, limit)
+
+    async def _get_public_spotify_tokens(self):
+        """Get public Spotify tokens with proper browser simulation"""
+        import aiohttp
+        import random
+        import time
+        import json
+        import uuid
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=30)
+
+            # Create session with cookie jar - no cookies set initially
+            jar = aiohttp.CookieJar()
+            async with aiohttp.ClientSession(timeout=timeout, cookie_jar=jar) as session:
+
+                # Step 1: Visit main page exactly as browser does
+                main_headers = {
+                    'Host': 'open.spotify.com',
+                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
+                    'Priority': 'u=0, i'
+                }
+
+                download_logger.info("Step 1: Visiting main Spotify page to establish session")
+                async with session.get('https://open.spotify.com/', headers=main_headers, allow_redirects=True) as main_response:
+                    if main_response.status == 200:
+                        # Wait a bit to simulate real browser behavior
+                        await asyncio.sleep(1)
+                        download_logger.info("Main page visited successfully, cookies established")
+
+                        # Check if we got cookies and log them
+                        cookies_count = len(session.cookie_jar)
+                        download_logger.info(f"Received {cookies_count} cookies from main page")
+
+                        # Log cookie details for debugging
+                        for cookie in session.cookie_jar:
+                            try:
+                                domain = getattr(cookie, 'domain', 'unknown')
+                                download_logger.info(f"Cookie: {cookie.key}={cookie.value[:50]}... (domain: {domain})")
+                            except Exception as e:
+                                download_logger.info(f"Cookie: {cookie.key}={str(cookie.value)[:50]}...")
+                    else:
+                        download_logger.error(f"Main page visit failed: {main_response.status}")
+                        return None
+
+                # Step 1.5: Visit consent page to get more cookies
+                download_logger.info("Step 1.5: Visiting consent page")
+                consent_headers = main_headers.copy()
+                consent_headers['Referer'] = 'https://open.spotify.com/'
+
+                async with session.get('https://open.spotify.com/?consent=true', headers=consent_headers) as consent_response:
+                    if consent_response.status == 200:
+                        download_logger.info("Consent page visited successfully")
+                        await asyncio.sleep(0.5)
+                    else:
+                        download_logger.warning(f"Consent page visit failed: {consent_response.status}")
+
+                # Step 2: OPTIONS request to clienttoken (CORS preflight)
+                options_headers = {
+                    'Host': 'clienttoken.spotify.com',
+                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0',
+                    'Accept': '*/*',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Access-Control-Request-Method': 'POST',
+                    'Access-Control-Request-Headers': 'content-type',
+                    'Origin': 'https://open.spotify.com',
+                    'Sec-Fetch-Dest': 'empty',
+                    'Sec-Fetch-Mode': 'cors',
+                    'Sec-Fetch-Site': 'same-site',
+                    'Dnt': '1',
+                    'Sec-Gpc': '1',
+                    'Priority': 'u=4',
+                    'Te': 'trailers'
+                }
+
+                download_logger.info("Step 2: Sending OPTIONS preflight request")
+                async with session.options('https://clienttoken.spotify.com/v1/clienttoken', headers=options_headers) as options_response:
+                    download_logger.info(f"OPTIONS response status: {options_response.status}")
+
+                # Step 3: Get client token with exact payload from your trace
+                client_token_headers = {
+                    'Host': 'clienttoken.spotify.com',
+                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0',
+                    'Accept': 'application/json',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Content-Type': 'application/json',
+                    'Origin': 'https://open.spotify.com',
+                    'Sec-Fetch-Dest': 'empty',
+                    'Sec-Fetch-Mode': 'cors',
+                    'Sec-Fetch-Site': 'same-site',
+                    'Dnt': '1',
+                    'Sec-Gpc': '1',
+                    'Priority': 'u=4',
+                    'Te': 'trailers'
+                }
+
+                # Use the exact payload structure from your trace but with dynamic device_id
+                device_id = str(uuid.uuid4()).replace('-', '')[:24]  # Generate realistic device ID
+                client_token_payload = {
+                    "client_data": {
+                        "client_version": "1.2.73.375.gf083a0b6",
+                        "client_id": "d8a5ed958d274c2e8ee717e6a4b0971d",
+                        "js_sdk_data": {
+                            "device_brand": "unknown",
+                            "device_model": "unknown",
+                            "os": "linux",
+                            "os_version": "unknown",
+                            "device_id": device_id,
+                            "device_type": "computer"
+                        }
+                    }
+                }
+
+                download_logger.info("Step 3: Requesting client token")
+                async with session.post('https://clienttoken.spotify.com/v1/clienttoken', headers=client_token_headers, json=client_token_payload) as response:
+                    download_logger.info(f"Token request status: {response.status}")
+
+                    if response.status == 200:
+                        try:
+                            client_data = await response.json()
+                            download_logger.info(f"Client token response: {json.dumps(client_data, indent=2)}")
+
+                            client_token = client_data.get('granted_token', {}).get('token')
+
+                            if not client_token:
+                                download_logger.error("No client token in response")
+                                return None
+
+                            download_logger.info("Successfully obtained client token")
+
+                            # Step 4: Visit the main page again to establish proper session state
+                            download_logger.info("Step 4: Re-visiting main page to establish session for token API")
+                            await asyncio.sleep(1)
+
+                            async with session.get('https://open.spotify.com/', headers=main_headers) as revisit_response:
+                                if revisit_response.status == 200:
+                                    download_logger.info("Re-visited main page successfully")
+                                    await asyncio.sleep(1)
+                                else:
+                                    download_logger.warning(f"Re-visit failed: {revisit_response.status}")
+
+                            # Step 5: Get authorization token using /api/token endpoint
+                            import random
+                            totp = random.randint(600000, 699999)
+                            token_url = f"https://open.spotify.com/api/token?reason=init&productType=web-player&totp={totp}&totpServer={totp}&totpVer=46"
+
+                            token_headers = {
+                                'Host': 'open.spotify.com',
+                                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0',
+                                'Accept': '*/*',
+                                'Accept-Language': 'en-US,en;q=0.5',
+                                'Accept-Encoding': 'gzip, deflate, br',
+                                'Referer': 'https://open.spotify.com/',
+                                'Sentry-Trace': f'{device_id[:32]}-{device_id[32:48]}-0',
+                                'Baggage': 'sentry-environment=production,sentry-release=open-server_2025-09-17_1758071143284_f083a0b,sentry-public_key=de32132fc06e4b28965ecf25332c3a25,sentry-trace_id=8089be3b178246539e77b8c1537297c5,sentry-sample_rate=0.008,sentry-sampled=false',
+                                'Sec-Fetch-Dest': 'empty',
+                                'Sec-Fetch-Mode': 'cors',
+                                'Sec-Fetch-Site': 'same-origin',
+                                'Dnt': '1',
+                                'Sec-Gpc': '1',
+                                'Priority': 'u=4',
+                                'Te': 'trailers'
+                            }
+
+                            download_logger.info("Step 5: Getting authorization token from /api/token")
+                            download_logger.info(f"Token URL: {token_url}")
+
+                            # Log cookies that will be sent
+                            cookie_count = len(session.cookie_jar)
+                            download_logger.info(f"Sending {cookie_count} cookies with token request")
+
+                            async with session.get(token_url, headers=token_headers) as token_response:
+                                download_logger.info(f"Token API response status: {token_response.status}")
+
+                                if token_response.status == 200:
+                                    try:
+                                        token_data = await token_response.json()
+                                        download_logger.info(f"Token API response: {json.dumps(token_data, indent=2)}")
+
+                                        auth_token = token_data.get('accessToken')
+                                        if auth_token:
+                                            download_logger.info("Successfully obtained authorization token from API")
+                                            return {
+                                                'auth_token': auth_token,
+                                                'client_token': client_token
+                                            }
+                                        else:
+                                            download_logger.warning("No accessToken in API response")
+                                            return {
+                                                'client_token': client_token
+                                            }
+
+                                    except json.JSONDecodeError as e:
+                                        download_logger.error(f"Failed to parse token API response as JSON: {e}")
+                                        response_text = await token_response.text()
+                                        download_logger.error(f"Raw token API response: {response_text}")
+                                        return {
+                                            'client_token': client_token
+                                        }
+                                else:
+                                    download_logger.error(f"Token API request failed: {token_response.status}")
+                                    response_text = await token_response.text()
+                                    download_logger.error(f"Token API error response: {response_text}")
+                                    return {
+                                        'client_token': client_token
+                                    }
+
+                        except json.JSONDecodeError as e:
+                            download_logger.error(f"Failed to parse client token response as JSON: {e}")
+                            response_text = await response.text()
+                            download_logger.error(f"Raw client token response: {response_text}")
+                            return None
+                    else:
+                        download_logger.error(f"Failed to get client token: {response.status}")
+                        response_text = await response.text()
+                        download_logger.error(f"Client token error response: {response_text}")
+                        return None
+
+        except Exception as e:
+            download_logger.error(f"Error getting public tokens: {e}")
+            import traceback
+            download_logger.error(f"Full traceback: {traceback.format_exc()}")
+            return None
+
+    async def _direct_spotify_api_search(self, query: str, limit: int):
+        """Direct API call to Spotify using public tokens"""
+        import aiohttp
+
+        # Try Playwright method first (most reliable)
+        try:
+            tokens = await self._get_spotify_tokens()
+            if tokens and tokens.get('auth_token') and tokens.get('client_token'):
+                auth_token = tokens['auth_token']
+                client_token = tokens['client_token']
+                download_logger.info("Using Playwright tokens for GraphQL API")
+            else:
+                raise Exception("Playwright method failed")
+        except Exception as e:
+            download_logger.warning(f"Playwright method failed: {e}, trying aiohttp method")
+
+            # Fallback to aiohttp method
+            tokens = await self._get_public_spotify_tokens()
+            if tokens and tokens.get('auth_token') and tokens.get('client_token'):
+                auth_token = tokens['auth_token']
+                client_token = tokens['client_token']
+                download_logger.info("Using aiohttp tokens for GraphQL API")
+            else:
+                download_logger.warning("Both methods failed, using hardcoded fallback")
+                # Final fallback to your working example tokens
+                auth_token = "BQBTosS3THqhAWB2SSu07-Cu7D-FWi2yNtDbOkf6atpI02UMnAMTjb4YkymmYSw5J6CJcbqvHPy393ED7q-XjweDfR8xnS4bPWv_0kG_ecsiEiBYWHDwwH53AhErQcrFRPLrUYAmrE4"
+                client_token = "AAA+jiLlwP6qxwt9cF3VGbaBjekNty6mPqC7YjsZD2wjLYIcU3UwjNIZDVohYjrCYJecUA43D259PxgYPC1tlrIAAFpCpcH+8VssxAIGgiUhFIBUUvl7gvLT9TtcHcZ+G73fsN8ehgQLwPYSrj33pn7TWreySAL6e7nfSDVKnr7UOsqAlUoM+8piqY1PPb/OeN1A9Sc+xKnanhocTYRfEDYWXofcev6VjPY9bA2/XnRbUll4/Cc5OI9vSpCekmg6ciygpzWWi2/A130WrJtt4dqwYiOVnCmYa3Uu4dl66LoEmMkksk4OyiAJtVL48U7sDDtKtQonckCuH645A1w5jI/YOg=="
+
+        payload = {
+            "variables": {
+                "searchTerm": query,
+                "offset": 0,
+                "limit": limit,
+                "numberOfTopResults": 5,
+                "includeAudiobooks": True,
+                "includeArtistHasConcertsField": False,
+                "includePreReleases": True,
+                "includeLocalConcertsField": False,
+                "includeAuthors": False
+            },
+            "operationName": "searchDesktop",
+            "extensions": {
+                "persistedQuery": {
+                    "version": 1,
+                    "sha256Hash": "d9f785900f0710b31c07818d617f4f7600c1e21217e80f5b043d1e78d74e6026"
+                }
+            }
+        }
+
+        headers = {
+            'Host': 'api-partner.spotify.com',
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0',
+            'Accept': 'application/json',
+            'Accept-Language': 'en',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Content-Type': 'application/json;charset=UTF-8',
+            'App-Platform': 'WebPlayer',
+            'Spotify-App-Version': '1.2.73.375.gf083a0b6',
+            'Client-Token': client_token,
+            'Origin': 'https://open.spotify.com',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-site',
+            'Authorization': f'Bearer {auth_token}',
+            'Dnt': '1',
+            'Sec-Gpc': '1',
+            'Priority': 'u=4',
+            'Te': 'trailers'
+        }
+
+        timeout = aiohttp.ClientTimeout(total=30)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(
+                'https://api-partner.spotify.com/pathfinder/v2/query',
+                json=payload,
+                headers=headers
+            ) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return self._extract_tracks_from_spotify_response(data, limit)
+                else:
+                    download_logger.error(f"Spotify API call failed with status: {response.status}")
+                    response_text = await response.text()
+                    download_logger.error(f"Response: {response_text}")
+                    if response.status == 401:
+                        raise Exception("Spotify API tokens expired - using fallback search")
+                    else:
+                        raise Exception(f"API call failed with status {response.status}")
+
+    def _extract_tracks_from_spotify_response(self, data: dict, limit: int):
+        """Extract track information from Spotify API response"""
+        tracks = []
+
+        try:
+            # Log the full response structure for debugging
+            download_logger.debug(f"Full API response keys: {list(data.keys())}")
+            if 'data' in data:
+                download_logger.debug(f"Data section keys: {list(data['data'].keys())}")
+                if 'searchV2' in data['data']:
+                    search_data = data['data']['searchV2']
+                    download_logger.debug(f"SearchV2 section keys: {list(search_data.keys())}")
+
+                    # Log sample of each section for debugging
+                    for section_name in search_data.keys():
+                        section = search_data[section_name]
+                        if isinstance(section, dict) and 'items' in section:
+                            items = section['items']
+                            download_logger.debug(f"{section_name} has {len(items)} items")
+                            if items:
+                                download_logger.debug(f"First item in {section_name}: {items[0].keys() if isinstance(items[0], dict) else type(items[0])}")
+                else:
+                    download_logger.debug("No searchV2 section found in data")
+            else:
+                download_logger.debug("No data section found in response")
+
+            # Navigate to the search data
+            search_data = data.get('data', {}).get('searchV2', {})
+
+            # Log what sections we have available for debugging
+            available_sections = list(search_data.keys())
+            download_logger.debug(f"Available search sections: {available_sections}")
+
+            # Try multiple approaches to find tracks
+
+            # 1. Check tracksV2 section (most common)
+            tracks_section = search_data.get('tracksV2', {})
+            if tracks_section:
+                tracks_items = tracks_section.get('items', [])
+                download_logger.debug(f"Found {len(tracks_items)} items in tracksV2")
+
+                for track_item in tracks_items[:limit]:
+                    # Extract the actual item from the wrapper
+                    item = track_item.get('item', {})
+                    download_logger.debug(f"Processing tracksV2 item: {item.get('__typename', 'no_typename')}")
+                    track_info = self._extract_track_from_item(item)
+                    if track_info:
+                        download_logger.debug(f"Successfully extracted track: {track_info['display_name']}")
+                        tracks.append(track_info)
+                    else:
+                        download_logger.debug("Failed to extract track from item")
+
+            # 2. Check topResults for tracks (old format)
+            if len(tracks) < limit:
+                top_results = search_data.get('topResults', {}).get('items', [])
+                download_logger.debug(f"Found {len(top_results)} items in topResults")
+
+                for item in top_results:
+                    if len(tracks) >= limit:
+                        break
+
+                    download_logger.debug(f"Processing topResults item: {item.get('__typename', 'no_typename')}")
+                    track_info = self._extract_track_from_item(item)
+                    if track_info:
+                        # Avoid duplicates
+                        track_id = track_info.get('id', '')
+                        if not any(t.get('id') == track_id for t in tracks):
+                            download_logger.debug(f"Successfully extracted track from topResults: {track_info['display_name']}")
+                            tracks.append(track_info)
+                        else:
+                            download_logger.debug(f"Skipping duplicate track: {track_info['display_name']}")
+                    else:
+                        download_logger.debug("Failed to extract track from topResults item")
+
+            # 2.5. Check topResultsV2 for tracks (new format)
+            if len(tracks) < limit:
+                top_results_v2 = search_data.get('topResultsV2', {}).get('itemsV2', [])
+                download_logger.debug(f"Found {len(top_results_v2)} items in topResultsV2")
+
+                for result_item in top_results_v2:
+                    if len(tracks) >= limit:
+                        break
+
+                    item = result_item.get('item', {})
+                    download_logger.debug(f"Processing topResultsV2 item: {item.get('__typename', 'no_typename')}")
+                    track_info = self._extract_track_from_item(item)
+                    if track_info:
+                        # Avoid duplicates
+                        track_id = track_info.get('id', '')
+                        if not any(t.get('id') == track_id for t in tracks):
+                            download_logger.debug(f"Successfully extracted track from topResultsV2: {track_info['display_name']}")
+                            tracks.append(track_info)
+                        else:
+                            download_logger.debug(f"Skipping duplicate track from topResultsV2: {track_info['display_name']}")
+                    else:
+                        download_logger.debug("Failed to extract track from topResultsV2 item")
+
+            # 3. Check for more tracks in other sections if needed
+            if len(tracks) < limit:
+                download_logger.debug("Looking for additional tracks in other sections...")
+
+                # Check if there are any other sections with tracks
+                for section_name, section_data in search_data.items():
+                    if len(tracks) >= limit:
+                        break
+
+                    if section_name not in ['tracksV2', 'topResults'] and isinstance(section_data, dict):
+                        items = section_data.get('items', [])
+                        if items:
+                            download_logger.debug(f"Checking {section_name} for additional tracks, found {len(items)} items")
+
+                            for item in items:
+                                if len(tracks) >= limit:
+                                    break
+
+                                # Try to extract track info from any item
+                                track_info = self._extract_track_from_item(item)
+                                if track_info:
+                                    # Avoid duplicates
+                                    track_id = track_info.get('id', '')
+                                    if not any(t.get('id') == track_id for t in tracks):
+                                        download_logger.debug(f"Successfully extracted track from {section_name}: {track_info['display_name']}")
+                                        tracks.append(track_info)
+                                    else:
+                                        download_logger.debug(f"Skipping duplicate track from {section_name}: {track_info['display_name']}")
+
+            download_logger.debug(f"Extracted {len(tracks)} tracks total")
+
+        except Exception as e:
+            download_logger.error(f"Error parsing Spotify API response: {e}")
+
+        return tracks[:limit]
+
+    def _extract_track_from_item(self, item):
+        """Extract track info from a generic item"""
+        try:
+            if item.get('__typename') == 'TrackResponseWrapper':
+                track_data = item.get('data', {})
+                if track_data.get('__typename') == 'Track':
+                    return self._build_track_info(track_data)
+
+        except Exception as e:
+            download_logger.debug(f"Error extracting track from item: {e}")
+
+        return None
+
+    def _extract_track_from_single(self, album_data):
+        """Extract track info from a single album"""
+        try:
+            album_uri = album_data.get('uri', '')
+            if album_uri.startswith('spotify:album:'):
+                # Convert album to track-like structure
+                album_id = album_uri.split(':')[-1]
+                title = album_data.get('name', 'Unknown')
+
+                # Extract artists
+                artists_data = album_data.get('artists', {}).get('items', [])
+                artist_names = []
+                for artist in artists_data:
+                    profile = artist.get('profile', {})
+                    name = profile.get('name', '')
+                    if name:
+                        artist_names.append(name)
+
+                artist = ', '.join(artist_names) if artist_names else 'Unknown'
+
+                # For singles, we'll use the album URL but treat it as track
+                track_url = f"https://open.spotify.com/album/{album_id}"
+
+                # Check playability
+                playability = album_data.get('playability', {})
+                is_playable = playability.get('playable', True)
+
+                if album_id and is_playable:
+                    return {
+                        'id': album_id,
+                        'title': title,
+                        'artist': artist,
+                        'album': title,  # For singles, album name = track name
+                        'url': track_url,
+                        'uri': album_uri,
+                        'display_name': f"{artist} - {title}",
+                        'is_single': True  # Flag to indicate this is from a single
+                    }
+
+        except Exception as e:
+            download_logger.debug(f"Error extracting track from single: {e}")
+
+        return None
+
+    def _build_track_info(self, track_data):
+        """Build track info from track data"""
+        try:
+            track_id = track_data.get('id', '')
+            title = track_data.get('name', 'Unknown')
+
+            # Extract artists
+            artists_data = track_data.get('artists', {}).get('items', [])
+            artist_names = []
+            for artist in artists_data:
+                profile = artist.get('profile', {})
+                name = profile.get('name', '')
+                if name:
+                    artist_names.append(name)
+
+            artist = ', '.join(artist_names) if artist_names else 'Unknown'
+
+            # Extract album info
+            album_data = track_data.get('albumOfTrack', {})
+            album_name = album_data.get('name', '') if album_data else ''
+
+            # Build track URL from ID
+            track_url = f"https://open.spotify.com/track/{track_id}"
+
+            # Check if track is playable
+            playability = track_data.get('playability', {})
+            is_playable = playability.get('playable', True)
+
+            if track_id and is_playable:
+                track_info = {
+                    'id': track_id,
+                    'title': title,
+                    'artist': artist,
+                    'album': album_name,
+                    'url': track_url,
+                    'uri': track_data.get('uri', f'spotify:track:{track_id}'),
+                    'display_name': f"{artist} - {title}"
+                }
+
+                if album_name:
+                    track_info['display_name'] += f" ({album_name})"
+
+                return track_info
+
+        except Exception as e:
+            download_logger.debug(f"Error building track info: {e}")
+
+        return None
+
+    async def _simple_spotify_search(self, query: str, limit: int):
+        """Simplified Spotify search using direct browser automation"""
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**self.BROWSER_LAUNCH_OPTIONS)
+            context = await browser.new_context()
+            page = await context.new_page()
+
+            try:
+                # Set realistic headers
+                await page.set_extra_http_headers({
+                    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-User': '?1',
+                    'Sec-Fetch-Dest': 'document'
+                })
+
+                # Navigate to Spotify search page
+                search_url = f"https://open.spotify.com/search/{quote(query)}"
+                await page.goto(search_url, wait_until='networkidle', timeout=30000)
+
+                # Wait for the page to load completely
+                await page.wait_for_timeout(5000)
+
+                # Try to trigger search by clicking tracks if available
+                try:
+                    await page.click('[data-testid="search-tracks-nav-item"]', timeout=3000)
+                    await page.wait_for_timeout(2000)
+                except:
+                    # If tracks tab doesn't exist, try other selectors
+                    try:
+                        await page.click('button[role="tab"]:has-text("Songs")', timeout=2000)
+                        await page.wait_for_timeout(2000)
+                    except:
+                        pass
+
+                # Extract track information from the page
+                tracks = []
+
+                # Multiple selectors to try for track elements
+                selectors_to_try = [
+                    '[data-testid="tracklist-row"]',
+                    '[data-testid="track-item"]',
+                    'div[role="row"]',
+                    '.track-item',
+                    'article[data-testid]'
+                ]
+
+                track_elements = []
+                for selector in selectors_to_try:
+                    try:
+                        elements = await page.query_selector_all(selector)
+                        if elements:
+                            track_elements = elements
+                            break
+                    except:
+                        continue
+
+                # If no specific track elements found, try to find links to tracks
+                if not track_elements:
+                    track_elements = await page.query_selector_all('a[href*="/track/"]')
+
+                for element in track_elements[:limit]:
+                    try:
+                        # Try different methods to extract track info
+                        track_info = await self._extract_track_from_element(page, element)
+                        if track_info:
+                            tracks.append(track_info)
+
+                    except Exception as e:
+                        download_logger.debug(f"Error extracting track from element: {e}")
+                        continue
+
+                await browser.close()
+                return tracks
+
+            except Exception as e:
+                await browser.close()
+                raise e
+
+    async def _extract_track_from_element(self, page, element):
+        """Extract track information from a DOM element"""
+        try:
+            # Try to get track URL first
+            track_url = None
+
+            # Method 1: Check if element itself is a link
+            href = await element.get_attribute('href')
+            if href and '/track/' in href:
+                track_url = f"https://open.spotify.com{href}" if href.startswith('/') else href
+
+            # Method 2: Look for track link within element
+            if not track_url:
+                link = await element.query_selector('a[href*="/track/"]')
+                if link:
+                    href = await link.get_attribute('href')
+                    track_url = f"https://open.spotify.com{href}" if href.startswith('/') else href
+
+            if not track_url:
+                return None
+
+            # Extract title and artist text
+            title = "Unknown"
+            artist = "Unknown"
+
+            # Try different selectors for title
+            title_selectors = [
+                '[data-testid="internal-track-link"]',
+                'a[href*="/track/"]',
+                '.track-name',
+                'h3',
+                'h4',
+                '[role="button"]'
+            ]
+
+            for selector in title_selectors:
+                try:
+                    title_element = await element.query_selector(selector)
+                    if title_element:
+                        title_text = await title_element.inner_text()
+                        if title_text and title_text.strip():
+                            title = title_text.strip()
+                            break
+                except:
+                    continue
+
+            # Try different selectors for artist
+            artist_selectors = [
+                'a[href*="/artist/"]',
+                '.artist-name',
+                'span:has-text("•")',
+                'div:has(a[href*="/artist/"])',
+                'p'
+            ]
+
+            artists = []
+            for selector in artist_selectors:
+                try:
+                    artist_elements = await element.query_selector_all(selector)
+                    for artist_el in artist_elements:
+                        artist_text = await artist_el.inner_text()
+                        if artist_text and artist_text.strip() and artist_text != title:
+                            artists.append(artist_text.strip())
+                except:
+                    continue
+
+            if artists:
+                artist = ', '.join(list(dict.fromkeys(artists))[:3])  # Remove duplicates, max 3
+
+            # Clean up title and artist
+            title = title.replace('\n', ' ').strip()
+            artist = artist.replace('\n', ' ').strip()
+
+            if title and title != "Unknown" and artist and artist != "Unknown":
+                return {
+                    'title': title,
+                    'artist': artist,
+                    'url': track_url,
+                    'display_name': f"{artist} - {title}"
+                }
+
+        except Exception as e:
+            download_logger.debug(f"Error in _extract_track_from_element: {e}")
+
+        return None
+
+    async def _make_spotify_search_api_call(self, query: str, limit: int, tokens: dict):
+        """Make the actual GraphQL API call to search Spotify"""
+        try:
+            import aiohttp
+
+            # GraphQL query payload
+            payload = {
+                "variables": {
+                    "searchTerm": query,
+                    "offset": 0,
+                    "limit": limit,
+                    "numberOfTopResults": 5,
+                    "includeAudiobooks": True,
+                    "includeArtistHasConcertsField": False,
+                    "includePreReleases": True,
+                    "includeLocalConcertsField": False,
+                    "includeAuthors": False
+                },
+                "operationName": "searchDesktop",
+                "extensions": {
+                    "persistedQuery": {
+                        "version": 1,
+                        "sha256Hash": "d9f785900f0710b31c07818d617f4f7600c1e21217e80f5b043d1e78d74e6026"
+                    }
+                }
+            }
+
+            headers = {
+                'Authorization': f'Bearer {tokens.get("auth_token", "")}',
+                'Client-Token': tokens.get('client_token', ''),
+                'Content-Type': 'application/json;charset=UTF-8',
+                'Accept': 'application/json',
+                'Accept-Language': 'en',
+                'Origin': 'https://open.spotify.com',
+                'Referer': 'https://open.spotify.com/',
+                'User-Agent': self.COMMON_HEADERS['User-Agent'],
+                'Sec-Fetch-Site': 'same-site',
+                'Sec-Fetch-Mode': 'cors',
+                'Sec-Fetch-Dest': 'empty'
+            }
+
+            timeout = aiohttp.ClientTimeout(total=30)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    'https://api-partner.spotify.com/pathfinder/v2/query',
+                    json=payload,
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return self._extract_tracks_from_search_response(data, limit)
+                    else:
+                        download_logger.error(f"Spotify API search failed with status: {response.status}")
+                        return await self._fallback_search(query, limit)
+
+        except Exception as e:
+            download_logger.error(f"Error making Spotify API call: {e}")
+            return await self._fallback_search(query, limit)
+
+    def _extract_tracks_from_search_response(self, data: dict, limit: int):
+        """Extract track information from Spotify API response"""
+        tracks = []
+        try:
+            # Navigate through the JSON structure
+            search_data = data.get('data', {}).get('searchV2', {})
+
+            # Look for tracks in different sections
+            tracks_data = []
+
+            # Check tracksV2 section
+            if 'tracksV2' in search_data:
+                tracks_section = search_data['tracksV2'].get('items', [])
+                for item in tracks_section:
+                    if item.get('__typename') == 'TrackResponseWrapper':
+                        track_data = item.get('data', {})
+                        if track_data.get('__typename') == 'Track':
+                            tracks_data.append(track_data)
+
+            # Check topResults section as well
+            if 'topResults' in search_data:
+                top_results = search_data['topResults'].get('items', [])
+                for item in top_results:
+                    if item.get('__typename') == 'TrackResponseWrapper':
+                        track_data = item.get('data', {})
+                        if track_data.get('__typename') == 'Track':
+                            tracks_data.append(track_data)
+
+            # Extract track information
+            for track_data in tracks_data[:limit]:
+                try:
+                    title = track_data.get('name', 'Unknown')
+
+                    # Extract artist names
+                    artists = track_data.get('artists', {}).get('items', [])
+                    artist_names = []
+                    for artist in artists:
+                        profile = artist.get('profile', {})
+                        if 'name' in profile:
+                            artist_names.append(profile['name'])
+
+                    artist = ', '.join(artist_names) if artist_names else 'Unknown'
+
+                    # Extract track URI and convert to URL
+                    track_uri = track_data.get('uri', '')
+                    if track_uri.startswith('spotify:track:'):
+                        track_id = track_uri.split(':')[-1]
+                        track_url = f"https://open.spotify.com/track/{track_id}"
+
+                        tracks.append({
+                            'title': title,
+                            'artist': artist,
+                            'url': track_url,
+                            'uri': track_uri,
+                            'display_name': f"{artist} - {title}"
+                        })
+
+                except Exception as e:
+                    download_logger.debug(f"Error extracting track data: {e}")
+                    continue
+
+        except Exception as e:
+            download_logger.error(f"Error parsing search response: {e}")
+
+        return tracks
+
+    async def _fallback_search(self, query: str, limit: int):
+        """Fallback search method using HTML parsing"""
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(**self.BROWSER_LAUNCH_OPTIONS)
+                page = await browser.new_page()
+                await page.set_extra_http_headers(self.COMMON_HEADERS)
+
+                # Navigate to search page
+                search_url = f"https://open.spotify.com/search/{quote(query)}/tracks"
+                await page.goto(search_url, wait_until='networkidle', timeout=30000)
+                await page.wait_for_timeout(3000)
+
+                tracks = []
+                try:
+                    # Try to extract tracks from the DOM
+                    track_elements = await page.query_selector_all('[data-testid="tracklist-row"]')
+
+                    for element in track_elements[:limit]:
+                        try:
+                            # Extract track title
+                            title_element = await element.query_selector('[data-testid="internal-track-link"]')
+                            title = await title_element.inner_text() if title_element else "Unknown"
+
+                            # Extract artist
+                            artist_elements = await element.query_selector_all('a[href*="/artist/"]')
+                            artists = []
+                            for artist_el in artist_elements:
+                                artist_name = await artist_el.inner_text()
+                                if artist_name:
+                                    artists.append(artist_name)
+
+                            artist = ', '.join(artists) if artists else "Unknown"
+
+                            # Extract track URL
+                            link_element = await element.query_selector('[data-testid="internal-track-link"]')
+                            track_href = await link_element.get_attribute('href') if link_element else None
+
+                            if track_href and '/track/' in track_href:
+                                if track_href.startswith('/'):
+                                    track_url = f"https://open.spotify.com{track_href}"
+                                else:
+                                    track_url = track_href
+
+                                tracks.append({
+                                    'title': title.strip(),
+                                    'artist': artist.strip(),
+                                    'url': track_url,
+                                    'display_name': f"{artist.strip()} - {title.strip()}"
+                                })
+
+                        except Exception as e:
+                            download_logger.debug(f"Error extracting track info in fallback: {e}")
+                            continue
+
+                except Exception as e:
+                    download_logger.error(f"Error in fallback search DOM parsing: {e}")
+
+                await browser.close()
+                return tracks
+
+        except Exception as e:
+            download_logger.error(f"Fallback search failed: {e}")
+            return []
+
     async def get_playlist_details(self, playlist_url: str):
         # First try with spotdown.app
         api_url = f"{self.BASE_URL}/api/song-details?url={quote(playlist_url)}"
@@ -769,6 +2118,7 @@ class SpotDownAPI:
                 payload = {"url": song_url}
 
                 download_logger.info(f"Download attempt {attempt + 1}/{MAX_API_ATTEMPTS} for: {song_title} via {self.current_base_url}")
+                download_logger.info(f"Sending URL to download API: {song_url}")
 
                 # Determine proxy usage strategy
                 use_proxy = attempt >= 2 or self._should_use_proxy_immediately()
@@ -964,7 +2314,9 @@ api_client = SpotDownAPI()
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("➕ Add Playlist", callback_data='add_playlist_prompt')],
+        [InlineKeyboardButton("🎵 Add Track", callback_data='add_track_prompt')],
         [InlineKeyboardButton("📚 My Playlists", callback_data='list_playlists_0')],
+        [InlineKeyboardButton("🔍 Search Songs", callback_data='search_prompt')],
         [InlineKeyboardButton("⚙️ Settings", callback_data='show_settings'), InlineKeyboardButton("🔄 Manual Sync", callback_data='manual_sync')]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1114,36 +2466,50 @@ async def list_playlists(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     text = "📚 *Your Playlists:*\n\n"
-    for pl_id, data in db.items():
+
+    for i, (pl_id, data) in enumerate(db.items(), 1):
         playlist_name = data.get('name', 'Unknown')
         song_count = len(data.get('songs', []))
         playlist_url = data.get('url', '')
+        is_custom = data.get('is_custom', False)
 
-        text += f"📁 `{playlist_name}` ({song_count} songs)\n"
+        # Add playlist header with number for clarity - add indicator for custom playlists
+        if is_custom:
+            text += f"**{i}.** 📁 `{playlist_name}` ({song_count} songs) 🏷️ *Custom*\n"
+        else:
+            text += f"**{i}.** 📁 `{playlist_name}` ({song_count} songs)\n"
 
-        # Create buttons row with Update, Link, and Delete
-        buttons_row = [
-            InlineKeyboardButton("🔄 Update", callback_data=f"update_{pl_id}"),
+        # Create first row with primary actions - exclude update for custom playlists
+        primary_row = [
+            InlineKeyboardButton(f"{i}. 📋 Songs", callback_data=f"list_songs_{pl_id}")
+        ]
+
+        # Only add update button for syncable playlists
+        if not is_custom and playlist_url:
+            primary_row.insert(0, InlineKeyboardButton(f"{i}. 🔄 Update", callback_data=f"update_{pl_id}"))
+
+        keyboard.append(primary_row)
+
+        # Create second row with secondary actions
+        secondary_row = [
+            InlineKeyboardButton(f"{i}. 🔍 Check", callback_data=f"check_integrity_{pl_id}"),
+            InlineKeyboardButton(f"{i}. 🗑️ Delete", callback_data=f"delete_{pl_id}")
         ]
 
         # Add link button if URL exists
         if playlist_url:
-            buttons_row.append(InlineKeyboardButton("🔗 Link", url=playlist_url))
+            secondary_row.append(InlineKeyboardButton(f"{i}. 🔗 Link", url=playlist_url))
 
-        buttons_row.append(InlineKeyboardButton("🗑️ Delete", callback_data=f"delete_{pl_id}"))
+        keyboard.append(secondary_row)
 
-        keyboard.append(buttons_row)
+        # Add separator line after each playlist (except last)
+        if i < len(db):
+            text += "─────────────────\n"
 
-        # Add integrity check and song management buttons
-        integrity_row = [
-            InlineKeyboardButton("🔍 Check Integrity", callback_data=f"check_integrity_{pl_id}"),
-            InlineKeyboardButton("📋 Songs", callback_data=f"list_songs_{pl_id}")
-        ]
-        keyboard.append(integrity_row)
-
-    # Add global integrity check button
+    # Add global actions
     keyboard.append([InlineKeyboardButton("🔍 Check All Playlists", callback_data='check_all_integrity')])
     keyboard.append([InlineKeyboardButton("⬅️ Back to menu", callback_data='main_menu')])
+
     await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -1157,9 +2523,10 @@ async def perform_update(update: Update, context: ContextTypes.DEFAULT_TYPE, pla
     playlist_data = db[playlist_id]
     playlist_name = playlist_data.get('name', 'Unknown')
     playlist_url = playlist_data.get('url', '')
+    is_custom = playlist_data.get('is_custom', False)
 
-    if not playlist_url:
-        await update.callback_query.edit_message_text("❌ No URL found for this playlist.")
+    if is_custom or not playlist_url:
+        await update.callback_query.edit_message_text("❌ Cannot sync custom playlists - they don't have a Spotify URL.")
         return
 
     await update.callback_query.edit_message_text(f"🔄 Updating playlist '{playlist_name}'...")
@@ -1331,17 +2698,104 @@ async def download_new_songs(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
 
 async def perform_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str):
+    """Delete playlist with confirmation"""
     db = load_db()
-    if playlist_id not in db: return
-    playlist_path = Path(db[playlist_id]['path'])
-    if playlist_path.exists():
-        for file in playlist_path.iterdir(): file.unlink()
-        playlist_path.rmdir()
-    del db[playlist_id]
-    save_db(db)
-    await update.callback_query.edit_message_text(f"🗑️ Playlist deleted.")
-    await asyncio.sleep(1)
-    await list_playlists(update, context)
+    logger.info(f"Attempting to delete playlist: '{playlist_id}'")
+    logger.info(f"Available playlists in DB: {list(db.keys())}")
+
+    if playlist_id not in db:
+        logger.error(f"Playlist '{playlist_id}' not found in database")
+        await update.callback_query.edit_message_text(f"❌ Playlist not found: {playlist_id}")
+        return
+
+    playlist_data = db[playlist_id]
+    playlist_name = playlist_data.get('name', 'Unknown')
+    song_count = len(playlist_data.get('songs', []))
+
+    # Show confirmation message first
+    message = f"🗑️ *Delete Playlist*\n\n"
+    message += f"📁 **Playlist:** {escape_markdown(playlist_name)}\n"
+    message += f"📊 **Songs:** {song_count}\n\n"
+    message += "⚠️ This will permanently delete:\n"
+    message += "• All song files from storage\n"
+    message += "• The playlist folder\n"
+    message += "• Database entries\n\n"
+    message += "This action cannot be undone. Are you sure?"
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Yes, Delete Everything", callback_data=f"confirm_delete_playlist_{playlist_id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="list_playlists")]
+    ]
+
+    await update.callback_query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def confirm_delete_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str):
+    """Actually delete the playlist and show success message"""
+    db = load_db()
+    if playlist_id not in db:
+        await update.callback_query.edit_message_text("❌ Playlist not found.")
+        return
+
+    playlist_data = db[playlist_id]
+    playlist_name = playlist_data.get('name', 'Unknown')
+    song_count = len(playlist_data.get('songs', []))
+
+    try:
+        # Delete files from filesystem - use stored path or fallback
+        stored_path = playlist_data.get('path')
+        if stored_path:
+            playlist_path = Path(stored_path)
+        else:
+            # Fallback to old method if no path stored
+            playlist_path = MUSIC_DIR / playlist_name
+
+        files_deleted = 0
+
+        logger.info(f"Attempting to delete playlist folder: {playlist_path}")
+
+        if playlist_path.exists():
+            for file in playlist_path.iterdir():
+                if file.is_file():
+                    file.unlink()
+                    files_deleted += 1
+            playlist_path.rmdir()
+            logger.info(f"Deleted playlist folder: {playlist_path}")
+        else:
+            logger.warning(f"Playlist folder not found at path: {playlist_path}")
+
+        # Remove from database
+        del db[playlist_id]
+        save_db(db)
+
+        # Show success message
+        message = f"✅ *Playlist Deleted Successfully!*\n\n"
+        message += f"📁 **Playlist:** {escape_markdown(playlist_name)}\n"
+        message += f"🗂️ **Files deleted:** {files_deleted}\n"
+        message += f"📊 **Songs removed:** {song_count}\n\n"
+        message += "🗃️ Database entries cleared\n"
+        message += "🗂️ Storage folder removed"
+
+        keyboard = [
+            [InlineKeyboardButton("📚 View Playlists", callback_data="list_playlists")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ]
+
+        await update.callback_query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    except Exception as e:
+        logger.error(f"Error deleting playlist: {e}")
+        await update.callback_query.edit_message_text(
+            f"❌ Error deleting playlist: {str(e)}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="list_playlists")]])
+        )
 
 async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show current bot settings"""
@@ -1491,7 +2945,10 @@ async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result:
             message = f"""✅ *Sync Completed*
 
-*Playlists synced:* {result['synced']}/{result['total']}
+*Total playlists in database:* {result['total_in_db']}
+*Syncable playlists:* {result['total']}
+*Custom playlists (excluded):* {result['custom_playlists']}
+*Successfully synced:* {result['synced']}/{result['total']}
 *New songs found:* {result['new_songs']}
 *Errors:* {result['errors']}"""
         else:
@@ -1706,7 +3163,7 @@ async def list_playlist_songs(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     if not songs:
         await update.callback_query.edit_message_text(
-            f"📋 *{playlist_name}*\n\nNo songs found.",
+            f"📋 *{escape_markdown(playlist_name)}*\n\nNo songs found.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='list_playlists_0')]]),
             parse_mode=ParseMode.MARKDOWN
         )
@@ -1718,7 +3175,7 @@ async def list_playlist_songs(update: Update, context: ContextTypes.DEFAULT_TYPE
     start_idx = page * songs_per_page
     end_idx = min(start_idx + songs_per_page, len(songs))
 
-    message = f"📋 *{playlist_name}*\n"
+    message = f"📋 *{escape_markdown(playlist_name)}*\n"
     message += f"Page {page + 1}/{total_pages} • {len(songs)} total songs\n\n"
 
     keyboard = []
@@ -1734,7 +3191,7 @@ async def list_playlist_songs(update: Update, context: ContextTypes.DEFAULT_TYPE
         file_path = playlist_dir / f"{sanitize_filename(artist_name)} - {sanitize_filename(song_title)}.mp3"
         status_icon = "✅" if file_path.exists() else "❌"
 
-        message += f"{i+1}. {status_icon} *{artist_name}* - {song_title} ({duration})\n"
+        message += f"{i+1}. {status_icon} *{escape_markdown(artist_name)}* - {escape_markdown(song_title)} ({escape_markdown(str(duration))})\n"
 
         # Add delete button for each song
         keyboard.append([InlineKeyboardButton(f"🗑️ Delete #{i+1}", callback_data=f"delete_song_{playlist_id}_{i}")])
@@ -1751,17 +3208,43 @@ async def list_playlist_songs(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     keyboard.append([InlineKeyboardButton("⬅️ Back to Playlists", callback_data='list_playlists_0')])
 
-    await update.callback_query.edit_message_text(
-        message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    # Check message length and truncate if necessary to avoid parsing errors
+    if len(message.encode('utf-8')) > 4000:  # Leave some margin from Telegram's 4096 limit
+        lines = message.split('\n')
+        truncated_message = ""
+        for line in lines:
+            if len((truncated_message + line + '\n').encode('utf-8')) < 3800:
+                truncated_message += line + '\n'
+            else:
+                break
+        truncated_message += f"\n... (message truncated for length)"
+        message = truncated_message
+
+    try:
+        await update.callback_query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except Exception as e:
+        # If markdown parsing fails, try without markdown
+        download_logger.warning(f"Markdown parsing failed for playlist songs, retrying without markdown: {e}")
+        # Remove all markdown formatting and try again
+        plain_message = message.replace('*', '').replace('_', '').replace('[', '').replace(']', '').replace('`', '').replace('\\', '')
+        await update.callback_query.edit_message_text(
+            plain_message,
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
 async def delete_song(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str, song_index: int):
     """Delete a specific song from playlist and filesystem"""
     db = load_db()
+    logger.info(f"Attempting to delete song {song_index} from playlist: '{playlist_id}'")
+    logger.info(f"Available playlists in DB: {list(db.keys())}")
+
     if playlist_id not in db:
-        await update.callback_query.edit_message_text("❌ Playlist not found.")
+        logger.error(f"Playlist '{playlist_id}' not found in database")
+        await update.callback_query.edit_message_text(f"❌ Playlist not found: {playlist_id}")
         return
 
     playlist_data = db[playlist_id]
@@ -1778,8 +3261,8 @@ async def delete_song(update: Update, context: ContextTypes.DEFAULT_TYPE, playli
 
     # Show confirmation
     message = f"🗑️ *Delete Song*\n\n"
-    message += f"Playlist: {playlist_name}\n"
-    message += f"Song: {artist_name} - {song_title}\n\n"
+    message += f"Playlist: {escape_markdown(playlist_name)}\n"
+    message += f"Song: {escape_markdown(artist_name)} - {escape_markdown(song_title)}\n\n"
     message += "This will delete both the file and remove it from the database. Are you sure?"
 
     keyboard = [
@@ -1796,8 +3279,12 @@ async def delete_song(update: Update, context: ContextTypes.DEFAULT_TYPE, playli
 async def confirm_delete_song(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str, song_index: int):
     """Confirm and delete a song"""
     db = load_db()
+    logger.info(f"Confirming delete song {song_index} from playlist: '{playlist_id}'")
+    logger.info(f"Available playlists in DB: {list(db.keys())}")
+
     if playlist_id not in db:
-        await update.callback_query.edit_message_text("❌ Playlist not found.")
+        logger.error(f"Playlist '{playlist_id}' not found in database")
+        await update.callback_query.edit_message_text(f"❌ Playlist not found: {playlist_id}")
         return
 
     playlist_data = db[playlist_id]
@@ -1813,13 +3300,25 @@ async def confirm_delete_song(update: Update, context: ContextTypes.DEFAULT_TYPE
     artist_name = sanitize_filename(song.get('artist', 'Unknown'))
 
     try:
-        # Delete file from filesystem
-        playlist_dir = MUSIC_DIR / playlist_name
+        # Delete file from filesystem - use stored path
+        playlist_path = playlist_data.get('path')
+        if playlist_path:
+            playlist_dir = Path(playlist_path)
+        else:
+            # Fallback to old method if no path stored
+            playlist_dir = MUSIC_DIR / playlist_name
+
         file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
+        file_deleted = False
+
+        logger.info(f"Attempting to delete file: {file_path}")
 
         if file_path.exists():
             file_path.unlink()
+            file_deleted = True
             logger.info(f"Deleted file: {file_path}")
+        else:
+            logger.warning(f"File not found at path: {file_path}")
 
         # Remove from database
         del songs[song_index]
@@ -1827,9 +3326,29 @@ async def confirm_delete_song(update: Update, context: ContextTypes.DEFAULT_TYPE
         db[playlist_id] = playlist_data
         save_db(db)
 
+        # Enhanced feedback message
+        remaining_songs = len(songs)
+        message = f"✅ *Song Deleted Successfully!*\n\n"
+        message += f"🎵 **Song:** {escape_markdown(artist_name)} - {escape_markdown(song.get('title', 'Unknown'))}\n"
+        message += f"📁 **Playlist:** {escape_markdown(playlist_name)}\n"
+        message += f"📊 **Remaining songs:** {remaining_songs}\n\n"
+
+        if file_deleted:
+            message += "🗂️ File removed from storage\n"
+            message += "🗃️ Entry removed from database"
+        else:
+            message += "⚠️ File not found in storage (already deleted)\n"
+            message += "🗃️ Entry removed from database"
+
+        keyboard = [
+            [InlineKeyboardButton("⬅️ Back to Songs", callback_data=f"list_songs_{playlist_id}")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ]
+
         await update.callback_query.edit_message_text(
-            f"✅ Song deleted successfully!\n\n{artist_name} - {song.get('title', 'Unknown')} has been removed from '{playlist_name}'.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Songs", callback_data=f"list_songs_{playlist_id}")]])
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
         )
 
     except Exception as e:
@@ -1839,17 +3358,103 @@ async def confirm_delete_song(update: Update, context: ContextTypes.DEFAULT_TYPE
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data=f"list_songs_{playlist_id}")]])
         )
 
+async def show_song_details(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str, song_index: int):
+    """Show details of a specific song from search results"""
+    db = load_db()
+    if playlist_id not in db:
+        await update.callback_query.edit_message_text("❌ Playlist not found.")
+        return
+
+    playlist_data = db[playlist_id]
+    playlist_name = playlist_data.get('name', 'Unknown')
+    songs = playlist_data.get('songs', [])
+
+    if song_index >= len(songs) or song_index < 0:
+        await update.callback_query.edit_message_text("❌ Song not found.")
+        return
+
+    song = songs[song_index]
+    title = song.get('title', 'Unknown')
+    artist = song.get('artist', 'Unknown')
+    url = song.get('url', '')
+
+    # Check if file exists
+    playlist_dir = MUSIC_DIR / playlist_name
+    file_path = playlist_dir / f"{sanitize_filename(artist)} - {sanitize_filename(title)}.mp3"
+    file_exists = file_path.exists()
+
+    message = f"🎵 *Song Details*\n\n"
+    message += f"**Title:** {escape_markdown(title)}\n"
+    message += f"**Artist:** {escape_markdown(artist)}\n"
+    message += f"**Playlist:** {escape_markdown(playlist_name)}\n"
+    message += f"**Status:** {'✅ Downloaded' if file_exists else '❌ Not Downloaded'}\n"
+
+    if url:
+        message += f"**URL:** [Open in Spotify]({url})\n"
+
+    keyboard = [
+        [InlineKeyboardButton("📁 View Playlist", callback_data=f"list_songs_{playlist_id}")],
+        [InlineKeyboardButton("🗑️ Delete Song", callback_data=f"delete_song_{playlist_id}_{song_index}")],
+        [InlineKeyboardButton("🔍 New Search", callback_data="main_menu")]
+    ]
+
+    await update.callback_query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
 # --- STATE AND BUTTON HANDLERS ---
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
+    logger.info(f"Button handler received callback_data: '{data}'")
 
     if data == 'add_playlist_prompt':
         await query.edit_message_text("Send me the Spotify playlist URL.")
         context.user_data['state'] = 'awaiting_url'
+    elif data == 'add_track_prompt':
+        keyboard = [
+            [InlineKeyboardButton("🔍 Search on Spotify", callback_data='search_spotify_tracks')],
+            [InlineKeyboardButton("🔗 Paste URL", callback_data='paste_track_url')],
+            [InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')]
+        ]
+        await query.edit_message_text(
+            "🎵 *Add Individual Track*\n\n"
+            "How would you like to add a track?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    elif data == 'search_spotify_tracks':
+        await query.edit_message_text(
+            "🔍 *Search Spotify*\n\n"
+            "Send me the name of the song or artist you want to search for.\n"
+            "Example: 'bohemian rhapsody queen' or 'imagine dragons thunder'",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data['state'] = 'awaiting_spotify_search'
+    elif data == 'paste_track_url':
+        await query.edit_message_text(
+            "🔗 *Paste Track URL*\n\n"
+            "Send me a Spotify track URL to download.\n"
+            "Example: `https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh`\n\n"
+            "💡 *Tip:* You can find the track URL by sharing a song from Spotify.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data['state'] = 'awaiting_track_url'
+    elif data == 'search_prompt':
+        await query.edit_message_text(
+            "🔍 *Search Songs*\n\n"
+            "Send me a song name or artist to search for.\n"
+            "Example: 'bohemian rhapsody' or 'the beatles'",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data['state'] = 'awaiting_search'
     elif data == 'list_playlists_0':  # Assuming simple pagination for now
+        await list_playlists(update, context)
+    elif data == 'list_playlists':
         await list_playlists(update, context)
     elif data == 'show_settings':
         await show_settings(update, context)
@@ -1873,41 +3478,83 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'confirm_download':
         await perform_download(update, context)
     elif data.startswith('update_'):
-        await perform_update(update, context, data.split('_')[1])
+        playlist_id = data.split('update_')[1]
+        await perform_update(update, context, playlist_id)
     elif data.startswith('download_new_'):
-        await download_new_songs(update, context, data.split('download_new_')[1])
+        playlist_id = data.split('download_new_')[1]
+        await download_new_songs(update, context, playlist_id)
+    elif data.startswith('delete_song_'):
+        # Format: delete_song_{playlist_id}_{song_index}
+        remaining = data.split('delete_song_')[1]
+        # Find the last underscore to get the song_index
+        last_underscore = remaining.rfind('_')
+        playlist_id = remaining[:last_underscore]
+        song_index = int(remaining[last_underscore + 1:])
+        await delete_song(update, context, playlist_id, song_index)
     elif data.startswith('delete_'):
-        await perform_delete(update, context, data.split('_')[1])
+        playlist_id = data.split('delete_')[1]
+        await perform_delete(update, context, playlist_id)
     elif data.startswith('check_integrity_'):
-        await perform_integrity_check(update, context, data.split('check_integrity_')[1])
+        playlist_id = data.split('check_integrity_')[1]
+        await perform_integrity_check(update, context, playlist_id)
     elif data.startswith('fix_integrity_'):
-        await fix_integrity_issues(update, context, data.split('fix_integrity_')[1])
+        playlist_id = data.split('fix_integrity_')[1]
+        await fix_integrity_issues(update, context, playlist_id)
     elif data == 'check_all_integrity':
         await check_all_playlists_integrity(update, context)
     elif data.startswith('list_songs_'):
-        await list_playlist_songs(update, context, data.split('list_songs_')[1])
+        playlist_id = data.split('list_songs_')[1]
+        await list_playlist_songs(update, context, playlist_id)
     elif data.startswith('songs_page_'):
-        parts = data.split('_')
-        playlist_id = parts[2]
-        page = int(parts[3])
+        # Format: songs_page_{playlist_id}_{page}
+        remaining = data.split('songs_page_')[1]
+        # Find the last underscore to get the page number
+        last_underscore = remaining.rfind('_')
+        playlist_id = remaining[:last_underscore]
+        page = int(remaining[last_underscore + 1:])
         await list_playlist_songs(update, context, playlist_id, page)
-    elif data.startswith('delete_song_'):
-        parts = data.split('_')
-        playlist_id = parts[2]
-        song_index = int(parts[3])
-        await delete_song(update, context, playlist_id, song_index)
+    elif data.startswith('confirm_delete_playlist_'):
+        playlist_id = data.split('confirm_delete_playlist_')[1]
+        await confirm_delete_playlist(update, context, playlist_id)
     elif data.startswith('confirm_delete_song_'):
-        parts = data.split('_')
-        playlist_id = parts[3]
-        song_index = int(parts[4])
+        # Format: confirm_delete_song_{playlist_id}_{song_index}
+        remaining = data.split('confirm_delete_song_')[1]
+        # Find the last underscore to get the song_index
+        last_underscore = remaining.rfind('_')
+        playlist_id = remaining[:last_underscore]
+        song_index = int(remaining[last_underscore + 1:])
         await confirm_delete_song(update, context, playlist_id, song_index)
+    elif data.startswith('show_song_'):
+        # Format: show_song_{playlist_id}_{song_index}
+        remaining = data.split('show_song_')[1]
+        # Find the last underscore to get the song_index
+        last_underscore = remaining.rfind('_')
+        playlist_id = remaining[:last_underscore]
+        song_index = int(remaining[last_underscore + 1:])
+        await show_song_details(update, context, playlist_id, song_index)
+    elif data == 'select_playlist_for_track':
+        await show_playlists_for_track(update, context)
+    elif data == 'create_playlist_for_track':
+        await query.edit_message_text(
+            "📝 *Create New Playlist*\n\nSend me the name for the new playlist:",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        context.user_data['state'] = 'awaiting_track_playlist_name'
+    elif data.startswith('add_track_to_'):
+        playlist_id = data.split('add_track_to_')[1]
+        await add_track_to_playlist(update, context, playlist_id)
+    elif data.startswith('select_spotify_track_'):
+        track_index = int(data.split('select_spotify_track_')[1])
+        await select_spotify_track(update, context, track_index)
     # ... (other handlers like update)
     elif data in ('cancel_action', 'main_menu'):
         context.user_data.clear()
         # Show main menu directly instead of calling start
         keyboard = [
             [InlineKeyboardButton("➕ Add Playlist", callback_data='add_playlist_prompt')],
+            [InlineKeyboardButton("🎵 Add Track", callback_data='add_track_prompt')],
             [InlineKeyboardButton("📚 My Playlists", callback_data='list_playlists_0')],
+            [InlineKeyboardButton("🔍 Search Songs", callback_data='search_prompt')],
             [InlineKeyboardButton("⚙️ Settings", callback_data='show_settings'), InlineKeyboardButton("🔄 Manual Sync", callback_data='manual_sync')]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1921,6 +3568,500 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_playlist_name(update, context)
     elif state == 'awaiting_sync_time':
         await handle_sync_time(update, context)
+    elif state == 'awaiting_search':
+        await handle_search_query(update, context)
+    elif state == 'awaiting_track_playlist_name':
+        await handle_track_playlist_name(update, context)
+    elif state == 'awaiting_track_url':
+        await handle_track_url(update, context)
+    elif state == 'awaiting_spotify_search':
+        await handle_spotify_search(update, context)
+
+async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, track_url: str = None):
+    """Handle Spotify track URL for individual song download"""
+    if not track_url:
+        track_url = update.message.text
+
+    # Validate Spotify track URL
+    if "open.spotify.com/track/" not in track_url:
+        await update.message.reply_text("❌ Invalid Spotify track URL.")
+        return
+
+    sent_message = await update.message.reply_text("🔍 Getting track information...")
+
+    track_info = await api_client.get_track_details(track_url)
+    if not track_info:
+        await sent_message.edit_text("❌ Could not get track information. The track may be unavailable or region-locked.")
+        return
+
+    # Store track info in user data
+    context.user_data['track_info'] = track_info
+    context.user_data['track_info']['url'] = track_url
+
+    # Show track info and ask for playlist selection
+    message = f"🎵 *Track Found*\n\n"
+    message += f"**Title:** {track_info['title']}\n"
+    message += f"**Artist:** {track_info['artist']}\n\n"
+    message += "Where would you like to save this track?"
+
+    keyboard = [
+        [InlineKeyboardButton("📁 Select Existing Playlist", callback_data='select_playlist_for_track')],
+        [InlineKeyboardButton("➕ Create New Playlist", callback_data='create_playlist_for_track')],
+        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')]
+    ]
+
+    await sent_message.edit_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle search query from user input"""
+    search_query = update.message.text.strip().lower()
+
+    # Clear the state
+    context.user_data.pop('state', None)
+
+    db = load_db()
+
+    if not db:
+        await update.message.reply_text("❌ No playlists found in database.")
+        return
+
+    results = []
+
+    # Search through all playlists and songs
+    for playlist_id, playlist_data in db.items():
+        playlist_name = playlist_data.get('name', 'Unknown')
+        songs = playlist_data.get('songs', [])
+
+        for idx, song in enumerate(songs):
+            title = song.get('title', '').lower()
+            artist = song.get('artist', '').lower()
+
+            # Check if search query matches title or artist
+            if search_query in title or search_query in artist:
+                results.append({
+                    'playlist_id': playlist_id,
+                    'playlist_name': playlist_name,
+                    'song_index': idx,
+                    'title': song.get('title', 'Unknown'),
+                    'artist': song.get('artist', 'Unknown'),
+                    'url': song.get('url', '')
+                })
+
+    if not results:
+        keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+        await update.message.reply_text(
+            f"🔍 No songs found matching: *{search_query}*",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Limit results to avoid message length issues
+    max_results = 10
+    if len(results) > max_results:
+        message = f"🔍 *Search Results* (showing {max_results} of {len(results)} matches)\n"
+        message += f"Query: *{escape_markdown(search_query)}*\n\n"
+        results = results[:max_results]
+    else:
+        message = f"🔍 *Search Results* ({len(results)} matches)\n"
+        message += f"Query: *{escape_markdown(search_query)}*\n\n"
+
+    # Create inline keyboard with results
+    keyboard = []
+    for i, result in enumerate(results):
+        button_text = f"🎵 {result['artist']} - {result['title']}"
+        if len(button_text) > 60:  # Truncate long titles
+            button_text = button_text[:57] + "..."
+
+        callback_data = f"show_song_{result['playlist_id']}_{result['song_index']}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+
+        # Add playlist info to message
+        message += f"{i+1}. *{escape_markdown(result['artist'])}* - {escape_markdown(result['title'])}\n"
+        message += f"   📁 Playlist: {escape_markdown(result['playlist_name'])}\n\n"
+
+    if len(results) == max_results and len(db) > 0:
+        message += f"💡 *Tip:* Use a more specific search term to narrow results."
+
+    # Add main menu button at the end
+    keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_spotify_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle Spotify search query from user input"""
+    search_query = update.message.text.strip()
+
+    # Clear the state
+    context.user_data.pop('state', None)
+
+    if not search_query:
+        await update.message.reply_text("❌ Please provide a search term.")
+        return
+
+    sent_message = await update.message.reply_text("🔍 Searching Spotify...")
+
+    try:
+        # Search for tracks on Spotify
+        search_results = await api_client.search_spotify_tracks(search_query, limit=8)
+
+        if not search_results:
+            keyboard = [
+                [InlineKeyboardButton("🔍 Try Another Search", callback_data='search_spotify_tracks')],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+            ]
+            await sent_message.edit_text(
+                f"🔍 No tracks found for: *{escape_markdown(search_query)}*\n\n"
+                "Try using different keywords or check the spelling.\n"
+                "If this persists, Spotify API tokens may need refreshing.",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+
+        # Store search results in user data
+        context.user_data['spotify_search_results'] = search_results
+
+        # Create message with results
+        message = f"🎵 *Spotify Search Results*\n"
+        message += f"Query: *{escape_markdown(search_query)}*\n\n"
+        message += "Select a track to download:\n\n"
+
+        keyboard = []
+        for i, track in enumerate(search_results):
+            # Add track info to message
+            message += f"{i+1}. **{track['artist']}** - {track['title']}\n"
+
+            # Create button for this track
+            button_text = f"🎵 {track['artist']} - {track['title']}"
+            if len(button_text) > 60:
+                button_text = button_text[:57] + "..."
+
+            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_spotify_track_{i}")])
+
+        # Add navigation buttons
+        keyboard.append([InlineKeyboardButton("🔍 New Search", callback_data='search_spotify_tracks')])
+        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
+
+        await sent_message.edit_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    except Exception as e:
+        logger.error(f"Error searching Spotify: {e}")
+        keyboard = [
+            [InlineKeyboardButton("🔍 Try Again", callback_data='search_spotify_tracks')],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ]
+        await sent_message.edit_text(
+            f"❌ *Search Error*\n\n"
+            f"There was an error searching Spotify. Please try again.\n\n"
+            f"Error: {str(e)}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+async def select_spotify_track(update: Update, context: ContextTypes.DEFAULT_TYPE, track_index: int):
+    """Handle selection of a track from Spotify search results"""
+    search_results = context.user_data.get('spotify_search_results', [])
+
+    if track_index >= len(search_results) or track_index < 0:
+        await update.callback_query.edit_message_text("❌ Invalid track selection.")
+        return
+
+    selected_track = search_results[track_index]
+
+    # Show loading message while getting track details
+    await update.callback_query.edit_message_text("🔍 Getting track details...")
+
+    # Get cached tokens from search if available
+    cached_tokens = context.user_data.get('spotify_tokens', {})
+
+    # Try advanced track details first, then fallback
+    track_info = await api_client.get_track_details_advanced(selected_track['url'], cached_tokens)
+
+    if not track_info:
+        # Fallback to basic track details
+        track_info = await api_client.get_track_details(selected_track['url'])
+
+    if not track_info:
+        # Final fallback to search result data
+        track_info = {
+            'title': selected_track['title'],
+            'artist': selected_track['artist'],
+            'url': selected_track['url'],
+            'download_url': ''
+        }
+
+    # Store track info in user data
+    context.user_data['track_info'] = track_info
+    context.user_data['track_info']['url'] = selected_track['url']
+
+    # Show track info and ask for playlist selection
+    message = f"🎵 *Track Selected*\n\n"
+    message += f"**Title:** {track_info['title']}\n"
+    message += f"**Artist:** {track_info['artist']}\n\n"
+    message += "Where would you like to save this track?"
+
+    keyboard = [
+        [InlineKeyboardButton("📁 Select Existing Playlist", callback_data='select_playlist_for_track')],
+        [InlineKeyboardButton("➕ Create New Playlist", callback_data='create_playlist_for_track')],
+        [InlineKeyboardButton("🔍 Back to Search", callback_data='search_spotify_tracks')],
+        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')]
+    ]
+
+    await update.callback_query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def show_playlists_for_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show existing playlists to select for adding a track"""
+    db = load_db()
+
+    if not db:
+        await update.callback_query.edit_message_text(
+            "❌ No playlists found. Create a new playlist first.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Create New Playlist", callback_data='create_playlist_for_track')]])
+        )
+        return
+
+    keyboard = []
+    message = "📁 *Select Playlist*\n\nChoose a playlist to add the track to:\n\n"
+
+    for playlist_id, playlist_data in db.items():
+        playlist_name = playlist_data.get('name', 'Unknown')
+        song_count = len(playlist_data.get('songs', []))
+
+        button_text = f"📁 {playlist_name} ({song_count} songs)"
+        if len(button_text) > 60:
+            button_text = button_text[:57] + "..."
+
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"add_track_to_{playlist_id}")])
+        message += f"• {playlist_name} ({song_count} songs)\n"
+
+    keyboard.append([InlineKeyboardButton("➕ Create New Playlist", callback_data='create_playlist_for_track')])
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')])
+
+    await update.callback_query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_track_playlist_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle new playlist name for track"""
+    playlist_name = update.message.text.strip()
+
+    # Clear state
+    context.user_data.pop('state', None)
+
+    # Validate playlist name
+    if not playlist_name or len(playlist_name.strip()) == 0:
+        await update.message.reply_text("❌ Please provide a valid playlist name.")
+        return
+
+    # Sanitize filename
+    sanitized_name = sanitize_filename(playlist_name)
+
+    # Create new playlist and add track
+    db = load_db()
+    playlist_id = f"track_playlist_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    # Get track info
+    track_info = context.user_data.get('track_info')
+    if not track_info:
+        await update.message.reply_text("❌ Track information lost. Please try again.")
+        return
+
+    # Create new playlist with the track (normalized)
+    normalized_track_info = normalize_track_info(track_info)
+    playlist_path = str(MUSIC_DIR / sanitized_name)
+
+    db[playlist_id] = {
+        'name': sanitized_name,
+        'url': '',  # Not a Spotify playlist, just a custom folder
+        'songs': [normalized_track_info],
+        'path': playlist_path,
+        'created_at': datetime.now().isoformat(),
+        'is_custom': True  # Mark as custom playlist for tracks
+    }
+
+    save_db(db)
+
+    # Download the track
+    await download_track_to_playlist(update, context, playlist_id, track_info)
+
+async def add_track_to_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str):
+    """Add track to existing playlist"""
+    db = load_db()
+
+    if playlist_id not in db:
+        await update.callback_query.edit_message_text("❌ Playlist not found.")
+        return
+
+    playlist_data = db[playlist_id]
+    playlist_name = playlist_data.get('name', 'Unknown')
+
+    # Get track info
+    track_info = context.user_data.get('track_info')
+    if not track_info:
+        await update.callback_query.edit_message_text("❌ Track information lost. Please try again.")
+        return
+
+    # Check if track already exists in playlist
+    existing_songs = playlist_data.get('songs', [])
+    track_url = track_info.get('url', '')
+
+    for song in existing_songs:
+        if song.get('url') == track_url:
+            await update.callback_query.edit_message_text(
+                f"⚠️ This track already exists in '{playlist_name}'.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+            )
+            return
+
+    # Normalize and add track to playlist
+    normalized_track_info = normalize_track_info(track_info)
+    existing_songs.append(normalized_track_info)
+    playlist_data['songs'] = existing_songs
+    db[playlist_id] = playlist_data
+    save_db(db)
+
+    # Download the track
+    await download_track_to_playlist(update, context, playlist_id, track_info, is_existing_playlist=True)
+
+async def download_track_to_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str, track_info: dict, is_existing_playlist: bool = False):
+    """Download a single track to a playlist"""
+    db = load_db()
+    playlist_data = db[playlist_id]
+    playlist_name = playlist_data.get('name', 'Unknown')
+
+    # Create playlist directory
+    playlist_dir = MUSIC_DIR / playlist_name
+    playlist_dir.mkdir(exist_ok=True)
+
+    track_title = sanitize_filename(track_info.get('title', 'Unknown'))
+    artist_name = sanitize_filename(track_info.get('artist', 'Unknown'))
+    file_path = playlist_dir / f"{artist_name} - {track_title}.mp3"
+
+    # Update message based on context
+    if hasattr(update, 'callback_query') and update.callback_query is not None:
+        message_method = update.callback_query.edit_message_text
+    else:
+        message_method = update.message.reply_text
+
+    if file_path.exists():
+        success_message = f"✅ *Track Added Successfully!*\n\n"
+        success_message += f"🎵 **Track:** {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}\n"
+        success_message += f"📁 **Playlist:** {playlist_name}\n"
+        success_message += f"💡 **Status:** File already exists\n\n"
+        success_message += f"The track was added to the playlist database."
+
+        keyboard = [
+            [InlineKeyboardButton("📁 View Playlist", callback_data=f"list_songs_{playlist_id}")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+        ]
+
+        await message_method(
+            success_message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Show download starting message
+    download_message = f"⏳ *Downloading Track*\n\n"
+    download_message += f"🎵 **Track:** {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}\n"
+    download_message += f"📁 **Playlist:** {playlist_name}\n\n"
+    download_message += "Please wait..."
+
+    await message_method(download_message, parse_mode=ParseMode.MARKDOWN)
+
+    try:
+        # Download the track
+        download_success = await api_client.download_song(track_info, file_path)
+
+        if download_success and file_path.exists():
+            success_message = f"✅ *Track Downloaded Successfully!*\n\n"
+            success_message += f"🎵 **Track:** {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}\n"
+            success_message += f"📁 **Playlist:** {playlist_name}\n"
+            success_message += f"📂 **Location:** {file_path}\n\n"
+
+            if is_existing_playlist:
+                total_songs = len(playlist_data.get('songs', []))
+                success_message += f"📊 **Total songs in playlist:** {total_songs}"
+
+            keyboard = [
+                [InlineKeyboardButton("📁 View Playlist", callback_data=f"list_songs_{playlist_id}")],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
+            ]
+        else:
+            # Remove from database if download failed
+            songs = playlist_data.get('songs', [])
+            songs = [s for s in songs if s.get('url') != track_info.get('url')]
+            playlist_data['songs'] = songs
+            db[playlist_id] = playlist_data
+            save_db(db)
+
+            success_message = f"❌ *Download Failed*\n\n"
+            success_message += f"🎵 **Track:** {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}\n"
+            success_message += f"📁 **Playlist:** {playlist_name}\n\n"
+            success_message += "The track could not be downloaded. It may be unavailable or region-locked."
+
+            keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+
+        # Send final message
+        if hasattr(update, 'callback_query') and update.callback_query is not None:
+            await update.callback_query.edit_message_text(
+                success_message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                success_message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+
+    except Exception as e:
+        logger.error(f"Error downloading track: {e}")
+
+        # Remove from database if download failed
+        songs = playlist_data.get('songs', [])
+        songs = [s for s in songs if s.get('url') != track_info.get('url')]
+        playlist_data['songs'] = songs
+        db[playlist_id] = playlist_data
+        save_db(db)
+
+        error_message = f"❌ *Download Error*\n\n"
+        error_message += f"🎵 **Track:** {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}\n"
+        error_message += f"📁 **Playlist:** {playlist_name}\n\n"
+        error_message += f"Error: {str(e)}"
+
+        keyboard = [[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]
+
+        if hasattr(update, 'callback_query') and update.callback_query is not None:
+            await update.callback_query.edit_message_text(
+                error_message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        else:
+            await update.message.reply_text(
+                error_message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.error("Exception while handling an update:", exc_info=context.error)
@@ -2090,6 +4231,8 @@ async def setup_menu_button(application):
             BotCommand("start", "Start the bot and show main menu"),
             BotCommand("sync", "Manual playlist sync"),
             BotCommand("settings", "Bot settings"),
+            BotCommand("search", "Search for songs in database"),
+            BotCommand("track", "Add individual track from Spotify URL"),
         ]
 
         await application.bot.set_my_commands(commands)
@@ -2116,6 +4259,109 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('⚙️ Bot Settings', reply_markup=reply_markup)
 
+async def track_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /track command - add individual songs from Spotify"""
+    if not context.args:
+        await update.message.reply_text(
+            "🎵 *Add Individual Track*\n\n"
+            "Use: `/track <spotify track URL>`\n"
+            "Example: `/track https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh`\n\n"
+            "Or use the '➕ Add Track' button in the main menu to search interactively.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    track_url = " ".join(context.args).strip()
+
+    # Validate Spotify track URL
+    if "open.spotify.com/track/" not in track_url:
+        await update.message.reply_text(
+            "❌ Invalid Spotify track URL.\n"
+            "Please provide a valid Spotify track URL like:\n"
+            "`https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    await handle_track_url(update, context, track_url)
+
+async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /search command - search for songs in database"""
+    if not context.args:
+        await update.message.reply_text(
+            "🔍 *Search Songs*\n\n"
+            "Use: `/search <song name or artist>`\n"
+            "Example: `/search bohemian rhapsody`",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    search_query = " ".join(context.args).lower()
+    db = load_db()
+
+    if not db:
+        await update.message.reply_text("❌ No playlists found in database.")
+        return
+
+    results = []
+
+    # Search through all playlists and songs
+    for playlist_id, playlist_data in db.items():
+        playlist_name = playlist_data.get('name', 'Unknown')
+        songs = playlist_data.get('songs', [])
+
+        for idx, song in enumerate(songs):
+            title = song.get('title', '').lower()
+            artist = song.get('artist', '').lower()
+
+            # Check if search query matches title or artist
+            if search_query in title or search_query in artist:
+                results.append({
+                    'playlist_id': playlist_id,
+                    'playlist_name': playlist_name,
+                    'song_index': idx,
+                    'title': song.get('title', 'Unknown'),
+                    'artist': song.get('artist', 'Unknown'),
+                    'url': song.get('url', '')
+                })
+
+    if not results:
+        await update.message.reply_text(
+            f"🔍 No songs found matching: *{escape_markdown(search_query)}*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+
+    # Limit results to avoid message length issues
+    max_results = 10
+    if len(results) > max_results:
+        message = f"🔍 *Search Results* (showing {max_results} of {len(results)} matches)\n"
+        message += f"Query: *{escape_markdown(search_query)}*\n\n"
+        results = results[:max_results]
+    else:
+        message = f"🔍 *Search Results* ({len(results)} matches)\n"
+        message += f"Query: *{escape_markdown(search_query)}*\n\n"
+
+    # Create inline keyboard with results
+    keyboard = []
+    for i, result in enumerate(results):
+        button_text = f"🎵 {result['artist']} - {result['title']}"
+        if len(button_text) > 60:  # Truncate long titles
+            button_text = button_text[:57] + "..."
+
+        callback_data = f"show_song_{result['playlist_id']}_{result['song_index']}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
+
+        # Add playlist info to message
+        message += f"{i+1}. *{escape_markdown(result['artist'])}* - {escape_markdown(result['title'])}\n"
+        message += f"   📁 Playlist: {escape_markdown(result['playlist_name'])}\n\n"
+
+    if len(results) == max_results and len(db) > 0:
+        message += f"💡 *Tip:* Use a more specific search term to narrow results."
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
 def main():
     global sync_manager
 
@@ -2135,6 +4381,8 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("sync", sync_command))
     application.add_handler(CommandHandler("settings", settings_command))
+    application.add_handler(CommandHandler("search", search_command))
+    application.add_handler(CommandHandler("track", track_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
