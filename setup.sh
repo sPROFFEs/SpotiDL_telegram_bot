@@ -80,6 +80,22 @@ fi
 print_status "Installing Playwright browsers..."
 playwright install chromium
 
+# Verify SpotDL fallback installation
+print_status "Verifying SpotDL fallback installation..."
+if python -c "import spotdl" 2>/dev/null; then
+    print_status "✅ SpotDL fallback is available"
+    # Test if spotdl command works
+    if command -v spotdl &> /dev/null; then
+        SPOTDL_VERSION=$(spotdl --version 2>&1 | head -1 || echo "unknown")
+        print_status "SpotDL version: $SPOTDL_VERSION"
+    else
+        print_warning "SpotDL Python package found but command not available"
+    fi
+else
+    print_error "❌ SpotDL fallback installation failed"
+    print_error "This may cause issues with fallback downloads"
+fi
+
 # Install system dependencies for yt-dlp fallback
 print_status "Checking system dependencies..."
 if command -v apt-get &> /dev/null; then
@@ -244,5 +260,10 @@ print_status "2. If updating from a previous version, reinstall dependencies:"
 print_status "   pip install -r requirements.txt --upgrade"
 print_status "3. Start the bot using one of the methods above"
 print_status "4. Send /start to your bot in Telegram"
+echo
+print_status "🎵 Fallback Methods Available:"
+print_status "• Primary: spotdown.app API (Playwright)"
+print_status "• Secondary: SpotDL (YouTube source)"
+print_status "• Tertiary: HTTP direct requests (last resort)"
 echo
 print_status "Happy downloading! 🎵"

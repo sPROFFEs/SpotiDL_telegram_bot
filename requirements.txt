@@ -1,5 +1,8 @@
 python-telegram-bot[job-queue]==21.0.1
 playwright==1.40.0
 aiohttp==3.8.6
-requests==2.32.2
-yt-dlp==2024.8.6
+requests>=2.32.3
+yt-dlp>=2024.8.6
+
+# SpotDL Fallback Dependencies
+spotdl>=4.4.0

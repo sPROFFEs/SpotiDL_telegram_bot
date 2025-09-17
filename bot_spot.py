@@ -24,6 +24,13 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
+# --- SPOTDL FALLBACK ---
+try:
+    from spotdl_fallback import try_spotdl_fallback
+    SPOTDL_AVAILABLE = True
+except ImportError:
+    SPOTDL_AVAILABLE = False
+
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN_HERE' # Replace with your actual bot token
 DB_FILE = Path('playlist_db.json')
@@ -58,6 +65,12 @@ logging.basicConfig(
     handlers=[file_handler, console_handler]
 )
 logger = logging.getLogger(__name__)
+
+# Log SpotDL fallback availability
+if SPOTDL_AVAILABLE:
+    logger.info("✅ SpotDL fallback disponible")
+else:
+    logger.warning("⚠️ SpotDL fallback no disponible - instalar con: pip install spotdl")
 
 # Additional loggers for different components
 sync_logger = logging.getLogger('sync')
@@ -819,13 +832,30 @@ class SpotDownAPI:
                             # For single tracks, we expect just one song in the response
                             if json_data and "songs" in json_data and len(json_data["songs"]) > 0:
                                 track_info = json_data["songs"][0]
+
+                                # Debug logging to see what data we're getting
+                                download_logger.info(f"🔍 Track data received: {track_info}")
+
+                                title = track_info.get("title", "Unknown")
+                                artist = track_info.get("artist", "Unknown")
+
+                                # Try alternative field names if the standard ones are empty or "Unknown"
+                                if title == "Unknown" or not title:
+                                    title = track_info.get("name", track_info.get("song", "Unknown"))
+
+                                if artist == "Unknown" or not artist:
+                                    artist = track_info.get("artists", track_info.get("performer", "Unknown"))
+
+                                download_logger.info(f"🎵 Extracted - Title: '{title}', Artist: '{artist}'")
+
                                 return {
-                                    "title": track_info.get("title", "Unknown"),
-                                    "artist": track_info.get("artist", "Unknown"),
+                                    "title": title,
+                                    "artist": artist,
                                     "url": track_url,
                                     "download_url": track_info.get("url", "")
                                 }
 
+                    download_logger.warning(f"❌ No song data found in API response for: {track_url}")
                     await browser.close()
                     return None
 
@@ -2146,21 +2176,38 @@ class SpotDownAPI:
                 download_logger.warning(f"Download attempt {attempt + 1} failed: {e}")
                 await self._handle_api_failure()
 
-                # Try fallback HTTP method on browser failures
-                if "Failed to start browser" in str(e) and attempt >= 2:
-                    download_logger.info("Trying HTTP fallback method due to browser issues...")
-                    success = await self._try_http_fallback(song_url, download_path)
-                    if success:
-                        download_logger.info(f"✅ Successfully downloaded {song_title} using HTTP fallback")
-                        return True
-
             # Wait before retrying (exponential backoff with jitter)
             if attempt < MAX_API_ATTEMPTS - 1:
                 delay = RETRY_DELAY_SECONDS * (2 ** attempt) + random.uniform(1, 3)  # Add jitter
                 download_logger.info(f"Waiting {delay:.1f}s before retry...")
                 await asyncio.sleep(delay)
 
-        download_logger.error(f"Failed to download {song_title} after {MAX_API_ATTEMPTS} attempts")
+        # Secondary fallback: Try SpotDL (different source - YouTube)
+        if SPOTDL_AVAILABLE:
+            download_logger.info(f"🎵 Trying SpotDL fallback (YouTube source) for: {song_title}")
+            try:
+                success = await try_spotdl_fallback(song_url, download_path)
+                if success:
+                    download_logger.info(f"✅ Successfully downloaded {song_title} using SpotDL fallback")
+                    return True
+                else:
+                    download_logger.warning(f"SpotDL fallback failed for: {song_title}")
+            except Exception as e:
+                download_logger.error(f"SpotDL fallback error: {e}")
+
+        # Tertiary fallback: Try HTTP direct (last resort, same source)
+        download_logger.info(f"🔄 Trying HTTP direct fallback as last resort for: {song_title}")
+        try:
+            success = await self._try_http_fallback(song_url, download_path)
+            if success:
+                download_logger.info(f"✅ Successfully downloaded {song_title} using HTTP direct fallback")
+                return True
+            else:
+                download_logger.warning(f"HTTP direct fallback also failed for: {song_title}")
+        except Exception as e:
+            download_logger.error(f"HTTP direct fallback error: {e}")
+
+        download_logger.error(f"Failed to download {song_title} after {MAX_API_ATTEMPTS} attempts and all fallbacks")
         return False
 
     async def _make_download_request(self, api_url: str, payload: dict, download_path: Path, proxy: str = None):
@@ -3961,7 +4008,7 @@ async def download_track_to_playlist(update: Update, context: ContextTypes.DEFAU
 
     if file_path.exists():
         success_message = f"✅ *Track Added Successfully!*\n\n"
-        success_message += f"🎵 **Track:** {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}\n"
+        success_message += f"🎵 **Track:** {track_info.get('title', 'Unknown')} - {track_info.get('artist', 'Unknown')}\n"
         success_message += f"📁 **Playlist:** {playlist_name}\n"
         success_message += f"💡 **Status:** File already exists\n\n"
         success_message += f"The track was added to the playlist database."
@@ -3980,7 +4027,7 @@ async def download_track_to_playlist(update: Update, context: ContextTypes.DEFAU
 
     # Show download starting message
     download_message = f"⏳ *Downloading Track*\n\n"
-    download_message += f"🎵 **Track:** {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}\n"
+    download_message += f"🎵 **Track:** {track_info.get('title', 'Unknown')} - {track_info.get('artist', 'Unknown')}\n"
     download_message += f"📁 **Playlist:** {playlist_name}\n\n"
     download_message += "Please wait..."
 
@@ -3992,7 +4039,7 @@ async def download_track_to_playlist(update: Update, context: ContextTypes.DEFAU
 
         if download_success and file_path.exists():
             success_message = f"✅ *Track Downloaded Successfully!*\n\n"
-            success_message += f"🎵 **Track:** {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}\n"
+            success_message += f"🎵 **Track:** {track_info.get('title', 'Unknown')} - {track_info.get('artist', 'Unknown')}\n"
             success_message += f"📁 **Playlist:** {playlist_name}\n"
             success_message += f"📂 **Location:** {file_path}\n\n"
 
@@ -4013,7 +4060,7 @@ async def download_track_to_playlist(update: Update, context: ContextTypes.DEFAU
             save_db(db)
 
             success_message = f"❌ *Download Failed*\n\n"
-            success_message += f"🎵 **Track:** {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}\n"
+            success_message += f"🎵 **Track:** {track_info.get('title', 'Unknown')} - {track_info.get('artist', 'Unknown')}\n"
             success_message += f"📁 **Playlist:** {playlist_name}\n\n"
             success_message += "The track could not be downloaded. It may be unavailable or region-locked."
 
@@ -4044,7 +4091,7 @@ async def download_track_to_playlist(update: Update, context: ContextTypes.DEFAU
         save_db(db)
 
         error_message = f"❌ *Download Error*\n\n"
-        error_message += f"🎵 **Track:** {track_info.get('artist', 'Unknown')} - {track_info.get('title', 'Unknown')}\n"
+        error_message += f"🎵 **Track:** {track_info.get('title', 'Unknown')} - {track_info.get('artist', 'Unknown')}\n"
         error_message += f"📁 **Playlist:** {playlist_name}\n\n"
         error_message += f"Error: {str(e)}"
 
