@@ -39,8 +39,8 @@ LOGS_DIR = Path('logs')
 SETTINGS_FILE = Path('bot_settings.json')
 
 # --- RETRY CONFIGURATION ---
-MAX_API_ATTEMPTS = 5       # Maximum attempts for API calls
-MAX_DOWNLOAD_ATTEMPTS = 3  # Try to download each song up to 3 times
+MAX_API_ATTEMPTS = 3       # Maximum attempts for API calls (reduced to prevent infinite loops)
+MAX_DOWNLOAD_ATTEMPTS = 2  # Try to download each song up to 2 times (reduced to prevent infinite loops)
 RETRY_DELAY_SECONDS = 3    # Wait 3 seconds between attempts
 API_TIMEOUT = 30000        # API request timeout in milliseconds
 
@@ -2128,8 +2128,186 @@ class SpotDownAPI:
         download_logger.error(f"Failed to get playlist details after {MAX_API_ATTEMPTS} attempts")
         return None
 
+    async def get_song_details(self, song_url: str):
+        """Get song details using the proper API flow"""
+        # Use the same flow as playlist but for individual songs
+        api_url = f"{self.BASE_URL}/api/song-details?url={quote(song_url)}"
+
+        try:
+            async with async_playwright() as p:
+                try:
+                    browser = await p.chromium.launch(**self.BROWSER_LAUNCH_OPTIONS)
+                except Exception as e:
+                    download_logger.error(f"Failed to start Playwright for song details: {e}")
+                    return None
+
+                # Create browser context with proper headers
+                browser_headers = {
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Sec-Fetch-Mode": "cors",
+                    "DNT": "1",
+                    "Sec-GPC": "1",
+                }
+
+                context = await browser.new_context(
+                    extra_http_headers=browser_headers,
+                    ignore_https_errors=True
+                )
+                page = await context.new_page()
+
+                try:
+                    # First visit the main page to establish session
+                    await page.goto(f"{self.BASE_URL}/", wait_until="domcontentloaded", timeout=30000)
+
+                    # Wait for session establishment
+                    await page.wait_for_timeout(2000)
+
+                    # Make API request with proper headers matching browser
+                    headers = {
+                        "Accept": "application/json, text/plain, */*",
+                        "Referer": "https://spotdown.app/",
+                        "Sec-Fetch-Site": "same-origin",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Dest": "empty"
+                    }
+
+                    response = await page.request.get(api_url, headers=headers, timeout=30000)
+                    if response.ok:
+                        result = await response.json()
+                        download_logger.info("✅ Successfully got song details from spotdown.app")
+                        return result
+                    else:
+                        download_logger.warning(f"Song details API request failed (Status: {response.status})")
+                        return None
+
+                except Exception as e:
+                    download_logger.error(f"Song details request exception: {e}")
+                    return None
+                finally:
+                    await browser.close()
+
+        except Exception as e:
+            download_logger.error(f"Failed to get song details: {e}")
+            return None
+
+    async def _download_with_session(self, song_url: str, download_path: Path, song_title: str) -> bool:
+        """Download song using the established session (Step 2 of the flow) - with proxy fallback"""
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(**self.BROWSER_LAUNCH_OPTIONS)
+
+                # Enhanced browser headers matching Firefox from your capture
+                browser_headers = {
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0",
+                    "Accept-Language": "en-US,en;q=0.5",
+                    "DNT": "1",
+                    "Sec-GPC": "1",
+                }
+
+                context = await browser.new_context(
+                    extra_http_headers=browser_headers,
+                    ignore_https_errors=True,
+                    java_script_enabled=True,
+                    bypass_csp=True
+                )
+                page = await context.new_page()
+
+                try:
+                    # Visit main page to establish session
+                    await page.goto(f"{self.BASE_URL}/", wait_until="domcontentloaded", timeout=30000)
+
+                    # Simulate human behavior
+                    await page.mouse.move(random.randint(100, 800), random.randint(100, 600))
+                    await page.wait_for_timeout(random.randint(2000, 4000))
+
+                    # Prepare download request headers (exactly like browser)
+                    download_headers = {
+                        "Accept": "application/json, text/plain, */*",
+                        "Accept-Language": "en-US,en;q=0.5",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "Referer": "https://spotdown.app/",
+                        "Content-Type": "application/json",
+                        "Origin": "https://spotdown.app",
+                        "Sec-Fetch-Dest": "empty",
+                        "Sec-Fetch-Mode": "cors",
+                        "Sec-Fetch-Site": "same-origin",
+                        "DNT": "1",
+                        "Sec-GPC": "1",
+                        "Priority": "u=0",
+                        "Te": "trailers"
+                    }
+
+                    # Make download request
+                    payload = {"url": song_url}
+                    api_url = f"{self.BASE_URL}/api/download"
+
+                    download_logger.debug(f"Making download request to {api_url} with payload: {payload}")
+
+                    response = await page.request.post(
+                        api_url,
+                        data=json.dumps(payload),
+                        headers=download_headers,
+                        timeout=120000  # 2 minutes timeout
+                    )
+
+                    if response.ok:
+                        content = await response.body()
+                        content_type = response.headers.get('content-type', '').lower()
+
+                        # Check if response is JSON error message (like your 500 error example)
+                        if 'application/json' in content_type:
+                            try:
+                                json_response = json.loads(content.decode('utf-8'))
+                                if not json_response.get('success', True):
+                                    error_msg = json_response.get('message', 'Unknown error')
+                                    download_logger.warning(f"API returned error: {error_msg}")
+                                    return False
+                            except json.JSONDecodeError:
+                                pass  # Not valid JSON, continue with audio validation
+
+                        # Validate audio content
+                        if len(content) > 1000:
+                            if ('audio' in content_type or 'octet-stream' in content_type or
+                                len(content) > 100000 or content.startswith(b'ID3')):
+                                with open(download_path, 'wb') as f:
+                                    f.write(content)
+                                download_logger.info(f"✅ Download successful (Size: {len(content)} bytes, Type: {content_type})")
+                                return True
+                            else:
+                                download_logger.warning(f"Invalid content type: {content_type}, size: {len(content)} bytes")
+                                download_logger.debug(f"Content starts with: {content[:50]}")
+                                return False
+                        else:
+                            download_logger.warning(f"Response too small ({len(content)} bytes)")
+                            try:
+                                response_text = content.decode('utf-8')[:200]
+                                download_logger.debug(f"Small response content: {response_text}")
+                            except:
+                                pass
+                            return False
+                    else:
+                        download_logger.warning(f"Download request failed (Status: {response.status})")
+                        try:
+                            response_text = await response.text()
+                            download_logger.debug(f"Error response: {response_text[:500]}")
+                        except:
+                            pass
+                        return False
+
+                except Exception as e:
+                    download_logger.error(f"Download request exception: {e}")
+                    return False
+                finally:
+                    await browser.close()
+
+        except Exception as e:
+            download_logger.error(f"Session download failed: {e}")
+            return False
+
     async def download_song(self, song_url_or_data, download_path: Path):
-        """Download song with enhanced retry mechanism and proxy support"""
+        """Download song with enhanced 2-step API flow and proper session management"""
         # Handle both string URL and dict data
         if isinstance(song_url_or_data, dict):
             song_url = song_url_or_data.get('url', '')
@@ -2143,25 +2321,21 @@ class SpotDownAPI:
                 # Rate limiting to avoid overwhelming the server
                 await self._rate_limit()
 
-                # Use current base URL (might be switched due to failures)
-                api_url = f"{self.current_base_url}/api/download"
-                payload = {"url": song_url}
+                download_logger.info(f"Download attempt {attempt + 1}/{MAX_API_ATTEMPTS} for: {song_title}")
 
-                download_logger.info(f"Download attempt {attempt + 1}/{MAX_API_ATTEMPTS} for: {song_title} via {self.current_base_url}")
-                download_logger.info(f"Sending URL to download API: {song_url}")
+                # STEP 1: Get song details (mimicking browser behavior)
+                download_logger.debug(f"Step 1: Getting song details for {song_url}")
+                song_details = await self.get_song_details(song_url)
 
-                # Determine proxy usage strategy
-                use_proxy = attempt >= 2 or self._should_use_proxy_immediately()
-                proxy = None
+                if not song_details:
+                    download_logger.warning(f"Failed to get song details on attempt {attempt + 1}")
+                    await self._handle_api_failure()
+                    continue
 
-                if use_proxy:
-                    proxy = await self.proxy_manager.get_working_proxy()
-                    if proxy:
-                        download_logger.info(f"Using proxy for download attempt {attempt + 1}: {proxy}")
-                    else:
-                        download_logger.info(f"No working proxy available for attempt {attempt + 1}, trying direct connection")
+                # STEP 2: Download using established session
+                download_logger.debug(f"Step 2: Proceeding with download for {song_title}")
+                success = await self._download_with_session(song_url, download_path, song_title)
 
-                success = await self._make_download_request(api_url, payload, download_path, proxy)
                 if success:
                     download_logger.info(f"✅ Successfully downloaded {song_title} on attempt {attempt + 1}")
                     # Reset failure counter on success
@@ -2210,149 +2384,6 @@ class SpotDownAPI:
         download_logger.error(f"Failed to download {song_title} after {MAX_API_ATTEMPTS} attempts and all fallbacks")
         return False
 
-    async def _make_download_request(self, api_url: str, payload: dict, download_path: Path, proxy: str = None):
-        """Make a single download request attempt"""
-        async with async_playwright() as p:
-            browser_options = self.BROWSER_LAUNCH_OPTIONS.copy()
-
-            # Configure proxy if provided
-            if proxy:
-                browser_options['proxy'] = {'server': f'http://{proxy}'}
-
-            # Add SSL ignore args for problematic proxies
-            if 'args' not in browser_options:
-                browser_options['args'] = []
-
-            browser_options['args'].extend([
-                '--ignore-certificate-errors',
-                '--ignore-ssl-errors',
-                '--ignore-certificate-errors-spki-list',
-                '--disable-web-security',
-                '--allow-running-insecure-content',
-                '--disable-features=VizDisplayCompositor'
-            ])
-
-            try:
-                browser = await p.chromium.launch(**browser_options)
-            except Exception as e:
-                download_logger.error(f"Failed to start browser for download: {e}")
-                return False
-
-            # Enhanced browser headers with rotating User-Agents
-            user_agents = [
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            ]
-
-            browser_headers = {
-                "User-Agent": random.choice(user_agents),
-                "Accept-Language": "en-US,en;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br",
-                "DNT": "1",
-                "Connection": "keep-alive",
-                "Upgrade-Insecure-Requests": "1",
-            }
-
-            context = await browser.new_context(
-                extra_http_headers=browser_headers,
-                viewport={'width': 1920, 'height': 1080},
-                locale='en-US',
-                ignore_https_errors=True
-            )
-            page = await context.new_page()
-
-            try:
-                # Get base URL from api_url for proper referrer
-                from urllib.parse import urlparse
-                parsed_url = urlparse(api_url)
-                base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
-
-                # Visit the playlist page to establish session
-                playlist_url = f"{base_url}/playlist"
-                await page.goto(playlist_url,
-                               wait_until="domcontentloaded",
-                               timeout=API_TIMEOUT)
-
-                # Random delay to avoid detection
-                await page.wait_for_timeout(random.randint(2000, 5000))
-
-                # Enhanced download headers with proper referrer
-                download_headers = {
-                    "Content-Type": "application/json",
-                    "Accept": "application/json, text/plain, */*",
-                    "Origin": base_url,
-                    "Referer": playlist_url,
-                    "Sec-Fetch-Site": "same-origin",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Dest": "empty",
-                    "X-Requested-With": "XMLHttpRequest"
-                }
-
-                # Multiple timeout attempts for robustness
-                for timeout_attempt in range(2):
-                    try:
-                        timeout = 45000 if timeout_attempt == 0 else 60000
-                        response = await page.request.post(
-                            api_url,
-                            data=json.dumps(payload),
-                            headers=download_headers,
-                            timeout=timeout
-                        )
-                        break
-                    except Exception as timeout_e:
-                        if timeout_attempt == 1:
-                            raise timeout_e
-                        download_logger.warning(f"First timeout attempt failed, trying with longer timeout: {timeout_e}")
-                        await asyncio.sleep(2)
-
-                if response.ok:
-                    content = await response.body()
-                    if len(content) > 1000:  # Ensure we got actual audio data
-                        # Validate it's actually audio content by checking headers
-                        content_type = response.headers.get('content-type', '').lower()
-                        if 'audio' in content_type or 'octet-stream' in content_type or len(content) > 100000:
-                            with open(download_path, 'wb') as f:
-                                f.write(content)
-                            download_logger.info(f"Download successful (Size: {len(content)} bytes, Type: {content_type})")
-                            return True
-                        else:
-                            download_logger.warning(f"Invalid content type: {content_type}, size: {len(content)} bytes")
-                            return False
-                    else:
-                        download_logger.warning(f"Response too small ({len(content)} bytes), likely an error")
-                        # Log the actual response for debugging
-                        try:
-                            response_text = content.decode('utf-8')[:200]
-                            download_logger.debug(f"Small response content: {response_text}")
-                        except:
-                            pass
-                        return False
-                else:
-                    download_logger.warning(f"Download request failed (Status: {response.status})")
-                    try:
-                        response_text = await response.text()
-                        download_logger.debug(f"Error response body: {response_text[:500]}")
-
-                        # Handle specific error responses
-                        if response.status == 500:
-                            download_logger.info("HTTP 500 error - server may be overloaded, will retry with different strategy")
-                        elif response.status == 429:
-                            download_logger.info("HTTP 429 - Rate limited, will increase delays")
-                            # Increase minimum request interval
-                            self.min_request_interval = min(5.0, self.min_request_interval * 2)
-                        elif response.status >= 400:
-                            download_logger.info(f"HTTP {response.status} error - API may be having issues")
-                    except:
-                        pass
-                    return False
-
-            except Exception as e:
-                download_logger.error(f"Download request exception: {e}")
-                return False
-            finally:
-                await browser.close()
 
 api_client = SpotDownAPI()
 
@@ -2472,10 +2503,15 @@ async def perform_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if success:
                 break
             else:
-                await update.callback_query.edit_message_text(
-                    f"⚠️ Failed to download {song_title} (Attempt {attempt + 1}/{MAX_DOWNLOAD_ATTEMPTS}). Retrying in {RETRY_DELAY_SECONDS}s...",
-                )
-                await asyncio.sleep(RETRY_DELAY_SECONDS)
+                if attempt < MAX_DOWNLOAD_ATTEMPTS - 1:  # Only show retry message if not the last attempt
+                    await update.callback_query.edit_message_text(
+                        f"⚠️ Failed to download {song_title} (Attempt {attempt + 1}/{MAX_DOWNLOAD_ATTEMPTS}). Retrying in {RETRY_DELAY_SECONDS}s...",
+                    )
+                    await asyncio.sleep(RETRY_DELAY_SECONDS)
+                else:
+                    await update.callback_query.edit_message_text(
+                        f"❌ Failed to download {song_title} after {MAX_DOWNLOAD_ATTEMPTS} attempts.",
+                    )
 
         if success:
             downloaded_count += 1
@@ -2704,7 +2740,8 @@ async def download_new_songs(update: Update, context: ContextTypes.DEFAULT_TYPE,
                 success = await api_client.download_song(song, file_path)
                 if success:
                     break
-                await asyncio.sleep(RETRY_DELAY_SECONDS)
+                if attempt < MAX_DOWNLOAD_ATTEMPTS - 1:  # Only sleep if not the last attempt
+                    await asyncio.sleep(RETRY_DELAY_SECONDS)
 
             if success:
                 downloaded_count += 1
@@ -3828,23 +3865,47 @@ async def select_spotify_track(update: Update, context: ContextTypes.DEFAULT_TYP
     # Show loading message while getting track details
     await update.callback_query.edit_message_text("🔍 Getting track details...")
 
-    # Get cached tokens from search if available
-    cached_tokens = context.user_data.get('spotify_tokens', {})
+    # OPTIMIZED FLOW: Try spotdown.app API first (fast and direct)
+    track_info = None
 
-    # Try advanced track details first, then fallback
-    track_info = await api_client.get_track_details_advanced(selected_track['url'], cached_tokens)
+    try:
+        # Use the new spotdown.app get_song_details method
+        song_details = await api_client.get_song_details(selected_track['url'])
+        if song_details:
+            track_info = {
+                'title': selected_track['title'],  # Use search result data as it's more reliable
+                'artist': selected_track['artist'],
+                'url': selected_track['url'],
+                'download_url': selected_track['url'],  # spotdown.app will handle this
+                'source': 'spotdown_api'
+            }
+            download_logger.info(f"✅ Got track details from spotdown.app API for: {selected_track['title']}")
+    except Exception as e:
+        download_logger.warning(f"Failed to get details from spotdown.app API: {e}")
 
+    # FALLBACK 1: Spotify advanced API (if spotdown.app failed)
     if not track_info:
-        # Fallback to basic track details
+        await update.callback_query.edit_message_text("🔍 Trying Spotify API...")
+        cached_tokens = context.user_data.get('spotify_tokens', {})
+        track_info = await api_client.get_track_details_advanced(selected_track['url'], cached_tokens)
+        if track_info:
+            track_info['source'] = 'spotify_advanced'
+
+    # FALLBACK 2: Basic Playwright method (last resort)
+    if not track_info:
+        await update.callback_query.edit_message_text("🔍 Using fallback method...")
         track_info = await api_client.get_track_details(selected_track['url'])
+        if track_info:
+            track_info['source'] = 'spotify_basic'
 
+    # FINAL FALLBACK: Use search result data
     if not track_info:
-        # Final fallback to search result data
         track_info = {
             'title': selected_track['title'],
             'artist': selected_track['artist'],
             'url': selected_track['url'],
-            'download_url': ''
+            'download_url': selected_track['url'],
+            'source': 'search_data'
         }
 
     # Store track info in user data
