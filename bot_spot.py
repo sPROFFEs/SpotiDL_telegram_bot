@@ -26,10 +26,24 @@ from telegram.constants import ParseMode
 
 # --- SPOTDL FALLBACK ---
 try:
-    from spotdl_fallback import try_spotdl_fallback
+    from spotdl_fallback import try_spotdl_fallback, download_from_youtube_url, is_youtube_url
     SPOTDL_AVAILABLE = True
 except ImportError:
     SPOTDL_AVAILABLE = False
+
+# --- EZCONV DOWNLOADER ---
+try:
+    from ezconv_downloader import download_youtube_with_ezconv, is_youtube_url as ezconv_is_youtube_url
+    EZCONV_AVAILABLE = True
+except ImportError:
+    EZCONV_AVAILABLE = False
+
+# --- TUBETIFY CONVERTER ---
+try:
+    from tubetify_converter import spotify_to_youtube, get_youtube_for_spotify
+    TUBETIFY_AVAILABLE = True
+except ImportError:
+    TUBETIFY_AVAILABLE = False
 
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN_HERE' # Replace with your actual bot token
@@ -71,6 +85,18 @@ if SPOTDL_AVAILABLE:
     logger.info("✅ SpotDL fallback disponible")
 else:
     logger.warning("⚠️ SpotDL fallback no disponible - instalar con: pip install spotdl")
+
+# Log Ezconv downloader availability
+if EZCONV_AVAILABLE:
+    logger.info("✅ Ezconv YouTube downloader disponible")
+else:
+    logger.warning("⚠️ Ezconv YouTube downloader no disponible - instalar aiohttp y brotli")
+
+# Log Tubetify converter availability
+if TUBETIFY_AVAILABLE:
+    logger.info("✅ Tubetify Spotify→YouTube converter disponible")
+else:
+    logger.warning("⚠️ Tubetify converter no disponible - instalar beautifulsoup4")
 
 # Additional loggers for different components
 sync_logger = logging.getLogger('sync')
@@ -473,7 +499,7 @@ async def fix_corrupted_songs(playlist_id: str, corrupted_songs: list, missing_s
 
 # --- FREE PROXY SYSTEM ---
 class ProxyManager:
-    """Manages free proxy servers for API requests"""
+    """Manages free proxy servers for API requests - Enhanced for long playlists"""
 
     def __init__(self):
         # List of free proxy APIs and sources
@@ -483,23 +509,62 @@ class ProxyManager:
             "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt"
         ]
         self.proxies = []
+        self.working_proxies = []  # Cache of verified working proxies
+        self.failed_proxies = set()  # Track failed proxies to avoid them temporarily
         self.last_update = None
+        self.proxy_index = 0  # For rotation
+        self.requests_per_proxy = 0  # Track requests per proxy
+        self.max_requests_per_proxy = 15  # Switch proxy after X requests to avoid rate limits
 
-    async def get_working_proxy(self, context: ContextTypes.DEFAULT_TYPE = None):
-        """Get a working proxy from available sources"""
+    async def get_working_proxy(self, context: ContextTypes.DEFAULT_TYPE = None, force_new=False):
+        """Get a working proxy from available sources - Enhanced with rotation"""
         try:
-            # Update proxy list every 30 minutes
+            # Update proxy list every 20 minutes (more frequent for long lists)
             if not self.proxies or not self.last_update or \
-               (datetime.now() - self.last_update).total_seconds() > 1800:
+               (datetime.now() - self.last_update).total_seconds() > 1200:
                 await self._update_proxies()
 
-            # Test and return a working proxy
-            for proxy in self.proxies[:10]:  # Test first 10 proxies
-                if await self._test_proxy(proxy):
-                    logger.info(f"Using proxy: {proxy}")
-                    return proxy
+            # If we've used current proxy too much, force rotation
+            if self.requests_per_proxy >= self.max_requests_per_proxy:
+                force_new = True
+                self.requests_per_proxy = 0
 
-            logger.warning("No working proxies found")
+            # If we have working proxies cached and don't need new one, rotate through them
+            if self.working_proxies and not force_new:
+                proxy = self.working_proxies[self.proxy_index % len(self.working_proxies)]
+                self.proxy_index = (self.proxy_index + 1) % len(self.working_proxies)
+                self.requests_per_proxy += 1
+                logger.debug(f"Using cached proxy: {proxy} (request #{self.requests_per_proxy})")
+                return proxy
+
+            # Test and cache working proxies (test more proxies for better pool)
+            tested_count = 0
+            max_tests = min(25, len(self.proxies))  # Test more proxies
+
+            for proxy in self.proxies:
+                if proxy in self.failed_proxies:
+                    continue
+
+                if tested_count >= max_tests:
+                    break
+
+                tested_count += 1
+                if await self._test_proxy(proxy):
+                    if proxy not in self.working_proxies:
+                        self.working_proxies.append(proxy)
+                        logger.info(f"Added working proxy to pool: {proxy}")
+
+                    # Clean failed proxies periodically
+                    if len(self.failed_proxies) > 50:
+                        self.failed_proxies.clear()
+                        logger.info("Cleared failed proxies cache")
+
+                    self.requests_per_proxy = 1
+                    return proxy
+                else:
+                    self.failed_proxies.add(proxy)
+
+            logger.warning(f"No working proxies found after testing {tested_count} proxies")
             return None
 
         except Exception as e:
@@ -537,21 +602,39 @@ class ProxyManager:
             logger.error(f"Error updating proxies: {e}")
 
     async def _test_proxy(self, proxy: str) -> bool:
-        """Test if a proxy is working"""
+        """Test if a proxy is working - Faster with reduced timeout"""
         try:
             import aiohttp
             proxy_url = f"http://{proxy}"
 
+            # Use faster timeout for proxy testing to avoid hanging on bad proxies
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     "http://httpbin.org/ip",
                     proxy=proxy_url,
-                    timeout=aiohttp.ClientTimeout(total=5)
+                    timeout=aiohttp.ClientTimeout(total=3)  # Reduced from 5 to 3 seconds
                 ) as response:
                     return response.status == 200
 
         except Exception:
             return False
+
+    async def reset_proxy_stats(self):
+        """Reset proxy statistics - useful for long operations"""
+        self.requests_per_proxy = 0
+        self.proxy_index = 0
+        self.failed_proxies.clear()
+        logger.info("Reset proxy statistics for fresh start")
+
+    def get_proxy_stats(self):
+        """Get current proxy statistics"""
+        return {
+            'total_proxies': len(self.proxies),
+            'working_proxies': len(self.working_proxies),
+            'failed_proxies': len(self.failed_proxies),
+            'requests_per_current_proxy': self.requests_per_proxy,
+            'current_proxy_index': self.proxy_index
+        }
 
 # --- PLAYLIST SYNC SYSTEM ---
 class PlaylistSyncManager:
@@ -2307,7 +2390,7 @@ class SpotDownAPI:
             return False
 
     async def download_song(self, song_url_or_data, download_path: Path):
-        """Download song with enhanced 2-step API flow and proper session management"""
+        """Download song with enhanced 2-step API flow and proper session management - supports SpotDL priority"""
         # Handle both string URL and dict data
         if isinstance(song_url_or_data, dict):
             song_url = song_url_or_data.get('url', '')
@@ -2315,6 +2398,64 @@ class SpotDownAPI:
         else:
             song_url = song_url_or_data
             song_title = 'Unknown'
+
+        # Check user preference for download method
+        settings = load_settings()
+        preferred_method = settings.get('download_method', 'spotdown')
+
+        # NEW PRIMARY METHOD: Tubetify + Ezconv (Spotify → YouTube → Download)
+        if TUBETIFY_AVAILABLE and EZCONV_AVAILABLE:
+            download_logger.info(f"🔄 Trying Tubetify→Ezconv as primary method for: {song_title}")
+            try:
+                # Step 1: Convert Spotify URL to YouTube URL
+                youtube_videos = await spotify_to_youtube(song_url)
+                if youtube_videos:
+                    download_logger.info(f"🎯 Found {len(youtube_videos)} YouTube match(es)")
+
+                    # Use the first (best) match for automatic download
+                    best_match = youtube_videos[0]
+                    youtube_url = best_match['youtube_url']
+
+                    download_logger.info(f"Using best match: {youtube_url}")
+
+                    # Step 2: Download from YouTube using Ezconv
+                    result = await download_youtube_with_ezconv(youtube_url, download_path)
+                    if result and result.get('success'):
+                        download_logger.info(f"✅ Successfully downloaded {song_title} using Tubetify→Ezconv")
+                        return True
+                    else:
+                        download_logger.warning(f"Ezconv download failed for: {song_title}")
+
+                        # If first match fails and there are more options, could try others
+                        if len(youtube_videos) > 1:
+                            download_logger.info(f"Trying alternative matches ({len(youtube_videos)-1} remaining)")
+                            for i, video in enumerate(youtube_videos[1:], 2):
+                                try:
+                                    alt_url = video['youtube_url']
+                                    download_logger.info(f"Trying alternative {i}: {alt_url}")
+                                    result = await download_youtube_with_ezconv(alt_url, download_path)
+                                    if result and result.get('success'):
+                                        download_logger.info(f"✅ Successfully downloaded using alternative {i}")
+                                        return True
+                                except Exception as e:
+                                    download_logger.warning(f"Alternative {i} failed: {e}")
+                else:
+                    download_logger.warning(f"No YouTube match found for: {song_title}")
+            except Exception as e:
+                download_logger.error(f"Tubetify→Ezconv method error: {e}")
+
+        # If user prefers SpotDL and it's available, try it as fallback
+        if preferred_method == 'spotdl' and SPOTDL_AVAILABLE:
+            download_logger.info(f"🎵 Trying SpotDL as fallback method for: {song_title}")
+            try:
+                success = await try_spotdl_fallback(song_url, download_path)
+                if success:
+                    download_logger.info(f"✅ Successfully downloaded {song_title} using SpotDL (fallback)")
+                    return True
+                else:
+                    download_logger.warning(f"SpotDL fallback method failed for: {song_title}")
+            except Exception as e:
+                download_logger.error(f"SpotDL fallback method error: {e}")
 
         for attempt in range(MAX_API_ATTEMPTS):
             try:
@@ -2368,18 +2509,6 @@ class SpotDownAPI:
                     download_logger.warning(f"SpotDL fallback failed for: {song_title}")
             except Exception as e:
                 download_logger.error(f"SpotDL fallback error: {e}")
-
-        # Tertiary fallback: Try HTTP direct (last resort, same source)
-        download_logger.info(f"🔄 Trying HTTP direct fallback as last resort for: {song_title}")
-        try:
-            success = await self._try_http_fallback(song_url, download_path)
-            if success:
-                download_logger.info(f"✅ Successfully downloaded {song_title} using HTTP direct fallback")
-                return True
-            else:
-                download_logger.warning(f"HTTP direct fallback also failed for: {song_title}")
-        except Exception as e:
-            download_logger.error(f"HTTP direct fallback error: {e}")
 
         download_logger.error(f"Failed to download {song_title} after {MAX_API_ATTEMPTS} attempts and all fallbacks")
         return False
@@ -2904,6 +3033,20 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sync_time = settings.get('sync_time', '09:00')
     notify_status = "🟢 Enabled" if settings.get('notify_sync_results', True) else "🔴 Disabled"
 
+    # Download method setting
+    download_method = settings.get('download_method', 'spotdown')  # 'spotdown' or 'spotdl'
+    if download_method == 'spotdl':
+        if SPOTDL_AVAILABLE:
+            method_status = "🎵 SpotDL (YouTube)"
+        else:
+            method_status = "❌ SpotDL (Not Available)"
+            # Fallback to spotdown if SpotDL not available
+            settings['download_method'] = 'spotdown'
+            save_settings(settings)
+            download_method = 'spotdown'
+    else:
+        method_status = "🌐 SpotDown (Default)"
+
     # Show next sync time if enabled
     next_sync_info = ""
     if settings.get('sync_enabled', False):
@@ -2918,15 +3061,17 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 *Sync Day:* {sync_day}
 *Sync Time:* {sync_time}
 *Sync Notifications:* {notify_status}
+*Download Method:* {method_status}
 *Last Sync:* {last_sync_str}{next_sync_info}
 
-Configure when the bot should automatically check for new songs in your saved playlists."""
+Configure bot behavior and download preferences."""
 
     keyboard = [
         [InlineKeyboardButton("🔄 Toggle Auto Sync", callback_data='toggle_sync')],
         [InlineKeyboardButton("📅 Change Day", callback_data='change_sync_day')],
         [InlineKeyboardButton("⏰ Change Time", callback_data='change_sync_time')],
         [InlineKeyboardButton("🔔 Toggle Notifications", callback_data='toggle_notifications')],
+        [InlineKeyboardButton("🎵 Change Download Method", callback_data='toggle_download_method')],
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data='main_menu')]
     ]
 
@@ -2949,6 +3094,32 @@ async def toggle_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     status = "enabled" if settings['sync_enabled'] else "disabled"
     await update.callback_query.answer(f"Auto sync {status}")
+    await show_settings(update, context)
+
+async def toggle_download_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle between SpotDown and SpotDL download methods"""
+    settings = load_settings()
+    current_method = settings.get('download_method', 'spotdown')
+
+    if current_method == 'spotdown':
+        if SPOTDL_AVAILABLE:
+            settings['download_method'] = 'spotdl'
+            new_method = 'SpotDL (YouTube source)'
+            await update.callback_query.answer(f"Switched to {new_method}")
+        else:
+            await update.callback_query.answer("❌ SpotDL not available. Install with: pip install spotdl")
+            await show_settings(update, context)
+            return
+    else:
+        settings['download_method'] = 'spotdown'
+        new_method = 'SpotDown (default)'
+        await update.callback_query.answer(f"Switched to {new_method}")
+
+    save_settings(settings)
+
+    # Reset proxy statistics when changing download method
+    await proxy_manager.reset_proxy_stats()
+
     await show_settings(update, context)
 
 async def toggle_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3520,11 +3691,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['state'] = 'awaiting_spotify_search'
     elif data == 'paste_track_url':
+        youtube_status = "✅ Available (ezconv.com)" if EZCONV_AVAILABLE else "❌ Not Available"
         await query.edit_message_text(
             "🔗 *Paste Track URL*\n\n"
-            "Send me a Spotify track URL to download.\n"
-            "Example: `https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh`\n\n"
-            "💡 *Tip:* You can find the track URL by sharing a song from Spotify.",
+            "Send me a URL to download:\n\n"
+            "🎵 **Spotify Track:**\n"
+            "`https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh`\n\n"
+            f"📺 **YouTube Video:** {youtube_status}\n"
+            "`https://www.youtube.com/watch?v=dQw4w9WgXcQ`\n\n"
+            "💡 *Features:* Auto-title detection, playlist integration, high-quality downloads",
             parse_mode=ParseMode.MARKDOWN
         )
         context.user_data['state'] = 'awaiting_track_url'
@@ -3546,6 +3721,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await toggle_sync(update, context)
     elif data == 'toggle_notifications':
         await toggle_notifications(update, context)
+    elif data == 'toggle_download_method':
+        await toggle_download_method(update, context)
     elif data == 'change_sync_day':
         await change_sync_day(update, context)
     elif data == 'change_sync_time':
@@ -3630,6 +3807,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith('select_spotify_track_'):
         track_index = int(data.split('select_spotify_track_')[1])
         await select_spotify_track(update, context, track_index)
+    elif data == 'youtube_auto_filename':
+        await perform_youtube_download(update, context)
+    elif data == 'youtube_new_folder':
+        await youtube_download_to_new_folder(update, context)
+    elif data == 'youtube_select_playlist':
+        await youtube_select_playlist(update, context)
+    elif data == 'youtube_create_playlist':
+        await youtube_create_playlist(update, context)
+    elif data.startswith('youtube_add_to_'):
+        playlist_id = data.split('youtube_add_to_')[1]
+        await youtube_add_to_playlist(update, context, playlist_id)
+    elif data.startswith('select_youtube_video_'):
+        video_index = int(data.split('select_youtube_video_')[1])
+        await select_youtube_video(update, context, video_index)
+    elif data == 'auto_select_youtube':
+        await auto_select_youtube_video(update, context)
+    elif data == 'youtube_back_to_options':
+        # Recreate the original YouTube options menu
+        youtube_info = context.user_data.get('youtube_track_info')
+        if youtube_info:
+            video_title = youtube_info['title']
+            youtube_url = youtube_info['url']
+            keyboard = [
+                [InlineKeyboardButton("📥 Download to new folder", callback_data='youtube_new_folder')],
+                [InlineKeyboardButton("📂 Add to existing playlist", callback_data='youtube_select_playlist')],
+                [InlineKeyboardButton("🆕 Create new playlist", callback_data='youtube_create_playlist')],
+                [InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')]
+            ]
+            await update.callback_query.edit_message_text(
+                f"🎵 *YouTube Video Found*\n\n"
+                f"📺 **Title:** {video_title[:80]}{'...' if len(video_title) > 80 else ''}\n"
+                f"🔗 **URL:** `{youtube_url[:50]}...`\n\n"
+                f"What would you like to do with this video?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
     # ... (other handlers like update)
     elif data in ('cancel_action', 'main_menu'):
         context.user_data.clear()
@@ -3660,15 +3873,24 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_track_url(update, context)
     elif state == 'awaiting_spotify_search':
         await handle_spotify_search(update, context)
+    elif state == 'awaiting_youtube_filename':
+        await handle_youtube_filename(update, context)
+    elif state == 'awaiting_youtube_playlist_name':
+        await handle_youtube_playlist_name(update, context)
 
 async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, track_url: str = None):
-    """Handle Spotify track URL for individual song download"""
+    """Handle Spotify track URL or YouTube URL for individual song download"""
     if not track_url:
         track_url = update.message.text
 
+    # Check if it's a YouTube URL
+    if EZCONV_AVAILABLE and ezconv_is_youtube_url(track_url):
+        await handle_youtube_url(update, context, track_url)
+        return
+
     # Validate Spotify track URL
     if "open.spotify.com/track/" not in track_url:
-        await update.message.reply_text("❌ Invalid Spotify track URL.")
+        await update.message.reply_text("❌ Invalid URL. Please provide a Spotify track URL or YouTube URL.")
         return
 
     sent_message = await update.message.reply_text("🔍 Getting track information...")
@@ -3682,7 +3904,46 @@ async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     context.user_data['track_info'] = track_info
     context.user_data['track_info']['url'] = track_url
 
-    # Show track info and ask for playlist selection
+    # Check for multiple YouTube video options if Tubetify is available
+    if TUBETIFY_AVAILABLE and EZCONV_AVAILABLE:
+        await sent_message.edit_text("🔍 Searching for YouTube matches...")
+        try:
+            from tubetify_converter import spotify_to_youtube
+            youtube_videos = await spotify_to_youtube(track_url)
+
+            if len(youtube_videos) > 1:
+                # Store video options for manual selection
+                context.user_data['youtube_video_options'] = youtube_videos
+
+                # Show video selection menu
+                message = f"🎵 *Track Found*\n\n"
+                message += f"**Title:** {track_info['title']}\n"
+                message += f"**Artist:** {track_info['artist']}\n\n"
+                message += f"🎯 Found {len(youtube_videos)} YouTube matches. Choose the best one:\n\n"
+
+                keyboard = []
+                for i, video in enumerate(youtube_videos[:5]):  # Limit to 5 options
+                    video_title = video.get('video_found', video.get('title', 'Unknown'))
+                    if len(video_title) > 40:
+                        video_title = video_title[:37] + "..."
+                    keyboard.append([InlineKeyboardButton(
+                        f"🎬 {i+1}. {video_title}",
+                        callback_data=f'select_youtube_video_{i}'
+                    )])
+
+                keyboard.append([InlineKeyboardButton("🔄 Auto-select Best Match", callback_data='auto_select_youtube')])
+                keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')])
+
+                await sent_message.edit_text(
+                    message,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                return
+        except Exception as e:
+            logger.warning(f"Error getting YouTube options: {e}")
+
+    # Show track info and ask for playlist selection (default behavior)
     message = f"🎵 *Track Found*\n\n"
     message += f"**Title:** {track_info['title']}\n"
     message += f"**Artist:** {track_info['artist']}\n\n"
@@ -3965,6 +4226,456 @@ async def show_playlists_for_track(update: Update, context: ContextTypes.DEFAULT
         parse_mode=ParseMode.MARKDOWN
     )
 
+async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE, youtube_url: str):
+    """Handle YouTube URL - get info and allow adding to playlist or standalone download"""
+    sent_message = await update.message.reply_text("🎵 Getting video information...")
+
+    try:
+        if not EZCONV_AVAILABLE:
+            await sent_message.edit_text("❌ YouTube downloader not available. Please install required dependencies.")
+            return
+
+        # Get video information first using ezconv
+        from ezconv_downloader import EzconvDownloader
+        downloader = EzconvDownloader()
+
+        # Get token and video info
+        token = await downloader.get_token()
+        if not token:
+            await sent_message.edit_text("❌ Failed to get authentication token for YouTube download.")
+            return
+
+        convert_result = await downloader.convert_video(youtube_url, token)
+        if not convert_result:
+            await sent_message.edit_text("❌ Failed to process YouTube video. Please check the URL.")
+            return
+
+        video_title = convert_result.get('title', 'Unknown Video')
+        sanitized_title = downloader.sanitize_filename(video_title)
+
+        # Store video info for later use
+        context.user_data['youtube_track_info'] = {
+            'url': youtube_url,
+            'title': video_title,
+            'sanitized_title': sanitized_title,
+            'convert_result': convert_result
+        }
+
+        # Show options similar to Spotify tracks
+        keyboard = [
+            [InlineKeyboardButton("📥 Download to new folder", callback_data='youtube_new_folder')],
+            [InlineKeyboardButton("📂 Add to existing playlist", callback_data='youtube_select_playlist')],
+            [InlineKeyboardButton("🆕 Create new playlist", callback_data='youtube_create_playlist')],
+            [InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')]
+        ]
+
+        await sent_message.edit_text(
+            f"🎵 *YouTube Video Found*\n\n"
+            f"📺 **Title:** {video_title[:80]}{'...' if len(video_title) > 80 else ''}\n"
+            f"🔗 **URL:** `{youtube_url[:50]}...`\n\n"
+            f"What would you like to do with this video?",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    except Exception as e:
+        logger.error(f"Error handling YouTube URL: {e}")
+        await sent_message.edit_text("❌ Error processing YouTube URL.")
+
+async def youtube_download_to_new_folder(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download YouTube video to new folder"""
+    youtube_info = context.user_data.get('youtube_track_info')
+    if not youtube_info:
+        await update.callback_query.edit_message_text("❌ YouTube video information not found.")
+        return
+
+    video_title = youtube_info['title']
+    sanitized_title = youtube_info['sanitized_title']
+
+    # Create YouTube downloads directory
+    youtube_dir = MUSIC_DIR / "YouTube Downloads"
+    youtube_dir.mkdir(exist_ok=True)
+    file_path = youtube_dir / f"{sanitized_title}.mp3"
+
+    await update.callback_query.edit_message_text(
+        f"📥 Downloading: *{video_title[:50]}{'...' if len(video_title) > 50 else ''}*\n\nPlease wait...",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # Download using ezconv
+    result = await download_youtube_with_ezconv(youtube_info['url'], file_path)
+
+    if result and result.get('success'):
+        file_size = file_path.stat().st_size if file_path.exists() else 0
+        size_mb = file_size / (1024 * 1024)
+
+        final_message = (
+            f"✅ *YouTube Download Complete!*\n\n"
+            f"📁 File: `{sanitized_title}.mp3`\n"
+            f"💾 Size: {size_mb:.1f} MB\n"
+            f"📂 Location: `YouTube Downloads/`"
+        )
+
+        keyboard = [[InlineKeyboardButton("⬅️ Back to menu", callback_data='main_menu')]]
+        await update.callback_query.edit_message_text(
+            final_message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.callback_query.edit_message_text(
+            f"❌ *YouTube Download Failed*\n\nCould not download the video. Please try again.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # Clean up
+    context.user_data.pop('youtube_track_info', None)
+
+async def youtube_select_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show playlists for YouTube video"""
+    db = load_db()
+    if not db:
+        await update.callback_query.edit_message_text(
+            "You have no playlists. Create one first!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🆕 Create playlist", callback_data='youtube_create_playlist')]])
+        )
+        return
+
+    keyboard = []
+    for playlist_id, playlist_data in db.items():
+        playlist_name = playlist_data.get('name', 'Unknown')
+        song_count = len(playlist_data.get('songs', []))
+        keyboard.append([InlineKeyboardButton(
+            f"📁 {playlist_name} ({song_count} songs)",
+            callback_data=f'youtube_add_to_{playlist_id}'
+        )])
+
+    keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data='youtube_back_to_options')])
+
+    await update.callback_query.edit_message_text(
+        "📂 *Select a playlist:*",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def youtube_create_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompt for new playlist name for YouTube video"""
+    context.user_data['state'] = 'awaiting_youtube_playlist_name'
+    await update.callback_query.edit_message_text(
+        "📝 *Create New Playlist*\n\nSend me the name for the new playlist:",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def youtube_add_to_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str):
+    """Add YouTube video to existing playlist"""
+    youtube_info = context.user_data.get('youtube_track_info')
+    if not youtube_info:
+        await update.callback_query.edit_message_text("❌ YouTube video information not found.")
+        return
+
+    db = load_db()
+    if playlist_id not in db:
+        await update.callback_query.edit_message_text("❌ Playlist not found.")
+        return
+
+    playlist_data = db[playlist_id]
+    playlist_name = playlist_data.get('name', 'Unknown')
+    playlist_dir = MUSIC_DIR / playlist_name
+    playlist_dir.mkdir(exist_ok=True)
+
+    video_title = youtube_info['title']
+    sanitized_title = youtube_info['sanitized_title']
+    file_path = playlist_dir / f"{sanitized_title}.mp3"
+
+    await update.callback_query.edit_message_text(
+        f"📥 Adding to playlist: *{playlist_name}*\n\nDownloading: *{video_title[:40]}{'...' if len(video_title) > 40 else ''}*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # Download using ezconv
+    result = await download_youtube_with_ezconv(youtube_info['url'], file_path)
+
+    if result and result.get('success'):
+        # Create song entry for database
+        song_entry = {
+            'title': video_title,
+            'artist': 'YouTube',  # Default artist for YouTube videos
+            'url': youtube_info['url'],
+            'duration': '0:00',  # We don't get duration from ezconv
+            'source': 'youtube'
+        }
+
+        # Add to playlist
+        playlist_data['songs'].append(song_entry)
+        db[playlist_id] = playlist_data
+        save_db(db)
+
+        file_size = file_path.stat().st_size if file_path.exists() else 0
+        size_mb = file_size / (1024 * 1024)
+
+        final_message = (
+            f"✅ *Added to Playlist!*\n\n"
+            f"📂 Playlist: `{playlist_name}`\n"
+            f"📁 File: `{sanitized_title}.mp3`\n"
+            f"💾 Size: {size_mb:.1f} MB\n"
+            f"🎵 Total songs: {len(playlist_data['songs'])}"
+        )
+
+        keyboard = [[InlineKeyboardButton("⬅️ Back to menu", callback_data='main_menu')]]
+        await update.callback_query.edit_message_text(
+            final_message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await update.callback_query.edit_message_text(
+            f"❌ *Download Failed*\n\nCould not download the video. Please try again.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # Clean up
+    context.user_data.pop('youtube_track_info', None)
+
+async def handle_youtube_playlist_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle new playlist name for YouTube video"""
+    playlist_name = update.message.text.strip()
+    youtube_info = context.user_data.get('youtube_track_info')
+
+    if not youtube_info:
+        await update.message.reply_text("❌ YouTube video information not found.")
+        return
+
+    playlist_name = sanitize_filename(playlist_name)
+    playlist_dir = MUSIC_DIR / playlist_name
+    playlist_dir.mkdir(exist_ok=True)
+
+    video_title = youtube_info['title']
+    sanitized_title = youtube_info['sanitized_title']
+    file_path = playlist_dir / f"{sanitized_title}.mp3"
+
+    sent_message = await update.message.reply_text(
+        f"📝 Creating playlist: *{playlist_name}*\n\nDownloading: *{video_title[:40]}{'...' if len(video_title) > 40 else ''}*",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+    # Download using ezconv
+    result = await download_youtube_with_ezconv(youtube_info['url'], file_path)
+
+    if result and result.get('success'):
+        # Create song entry
+        song_entry = {
+            'title': video_title,
+            'artist': 'YouTube',
+            'url': youtube_info['url'],
+            'duration': '0:00',
+            'source': 'youtube'
+        }
+
+        # Create new playlist
+        import time
+        playlist_id = f"youtube_{int(time.time())}"
+        db = load_db()
+        db[playlist_id] = {
+            'name': playlist_name,
+            'url': '',  # No URL for custom playlists
+            'songs': [song_entry],
+            'path': str(playlist_dir),
+            'is_custom': True,
+            'source': 'youtube'
+        }
+        save_db(db)
+
+        file_size = file_path.stat().st_size if file_path.exists() else 0
+        size_mb = file_size / (1024 * 1024)
+
+        final_message = (
+            f"✅ *Playlist Created!*\n\n"
+            f"📂 Playlist: `{playlist_name}`\n"
+            f"📁 File: `{sanitized_title}.mp3`\n"
+            f"💾 Size: {size_mb:.1f} MB\n"
+            f"🎵 Songs: 1"
+        )
+
+        keyboard = [[InlineKeyboardButton("⬅️ Back to menu", callback_data='main_menu')]]
+        await sent_message.edit_text(
+            final_message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        await sent_message.edit_text(
+            f"❌ *Download Failed*\n\nCould not download the video. Please try again.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    # Clean up
+    context.user_data.pop('youtube_track_info', None)
+    context.user_data.pop('state', None)
+
+async def handle_youtube_filename(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle custom filename for YouTube download"""
+    filename = update.message.text.strip()
+    youtube_info = context.user_data.get('youtube_info')
+
+    if not youtube_info:
+        await update.message.reply_text("❌ YouTube download session expired.")
+        return
+
+    await perform_youtube_download(update, context, filename)
+
+async def perform_youtube_download(update: Update, context: ContextTypes.DEFAULT_TYPE, filename: str = None):
+    """Perform the actual YouTube download"""
+    youtube_info = context.user_data.get('youtube_info')
+    if not youtube_info:
+        await update.message.reply_text("❌ YouTube download session expired.")
+        return
+
+    youtube_url = youtube_info['url']
+
+    # Generate filename if not provided
+    if not filename:
+        import time
+        filename = f"youtube_download_{int(time.time())}"
+
+    # Sanitize filename
+    filename = sanitize_filename(filename)
+
+    # Create YouTube downloads directory
+    youtube_dir = MUSIC_DIR / "YouTube Downloads"
+    youtube_dir.mkdir(exist_ok=True)
+
+    file_path = youtube_dir / f"{filename}.mp3"
+
+    # Update message to show download progress
+    try:
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=youtube_info.get('message_id'),
+            text=f"📥 Downloading: *{filename}*\n\nPlease wait...",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    except:
+        pass
+
+    # Perform download
+    success = await download_from_youtube_url(youtube_url, file_path, filename)
+
+    if success:
+        # Get file size for info
+        file_size = file_path.stat().st_size if file_path.exists() else 0
+        size_mb = file_size / (1024 * 1024)
+
+        final_message = (
+            f"✅ *YouTube Download Complete!*\n\n"
+            f"📁 File: `{filename}.mp3`\n"
+            f"💾 Size: {size_mb:.1f} MB\n"
+            f"📂 Location: `YouTube Downloads/`"
+        )
+
+        keyboard = [[InlineKeyboardButton("⬅️ Back to menu", callback_data='main_menu')]]
+
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=youtube_info.get('message_id'),
+                text=final_message,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except:
+            await update.message.reply_text(final_message, parse_mode=ParseMode.MARKDOWN)
+    else:
+        error_message = (
+            f"❌ *YouTube Download Failed*\n\n"
+            f"Could not download from: `{youtube_url[:50]}...`\n\n"
+            "Please try again or check if the URL is valid."
+        )
+
+        try:
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=youtube_info.get('message_id'),
+                text=error_message,
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except:
+            await update.message.reply_text(error_message, parse_mode=ParseMode.MARKDOWN)
+
+    # Clean up state
+    context.user_data.pop('youtube_info', None)
+    context.user_data.pop('state', None)
+
+async def select_youtube_video(update: Update, context: ContextTypes.DEFAULT_TYPE, video_index: int):
+    """Handle manual YouTube video selection from multiple options"""
+    youtube_videos = context.user_data.get('youtube_video_options', [])
+    track_info = context.user_data.get('track_info', {})
+
+    if video_index >= len(youtube_videos):
+        await update.callback_query.edit_message_text("❌ Invalid video selection.")
+        return
+
+    selected_video = youtube_videos[video_index]
+    youtube_url = selected_video['youtube_url']
+    video_title = selected_video.get('video_found', selected_video.get('title', 'Unknown'))
+
+    # Store the selected video for download
+    context.user_data['selected_youtube_video'] = selected_video
+
+    message = f"🎯 *Video Selected*\n\n"
+    message += f"**Track:** {track_info.get('title', 'Unknown')}\n"
+    message += f"**Artist:** {track_info.get('artist', 'Unknown')}\n\n"
+    message += f"**Selected Video:** {video_title}\n"
+    message += f"**YouTube URL:** `{youtube_url}`\n\n"
+    message += "Where would you like to save this track?"
+
+    keyboard = [
+        [InlineKeyboardButton("📁 Select Existing Playlist", callback_data='select_playlist_for_track')],
+        [InlineKeyboardButton("➕ Create New Playlist", callback_data='create_playlist_for_track')],
+        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')]
+    ]
+
+    await update.callback_query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def auto_select_youtube_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-select the best YouTube video match"""
+    youtube_videos = context.user_data.get('youtube_video_options', [])
+    track_info = context.user_data.get('track_info', {})
+
+    if not youtube_videos:
+        await update.callback_query.edit_message_text("❌ No video options found.")
+        return
+
+    # Use the first (best) match
+    selected_video = youtube_videos[0]
+    youtube_url = selected_video['youtube_url']
+    video_title = selected_video.get('video_found', selected_video.get('title', 'Unknown'))
+
+    # Store the selected video for download
+    context.user_data['selected_youtube_video'] = selected_video
+
+    message = f"🤖 *Auto-Selected Best Match*\n\n"
+    message += f"**Track:** {track_info.get('title', 'Unknown')}\n"
+    message += f"**Artist:** {track_info.get('artist', 'Unknown')}\n\n"
+    message += f"**Selected Video:** {video_title}\n"
+    message += f"**YouTube URL:** `{youtube_url}`\n\n"
+    message += "Where would you like to save this track?"
+
+    keyboard = [
+        [InlineKeyboardButton("📁 Select Existing Playlist", callback_data='select_playlist_for_track')],
+        [InlineKeyboardButton("➕ Create New Playlist", callback_data='create_playlist_for_track')],
+        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')]
+    ]
+
+    await update.callback_query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
 async def handle_track_playlist_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle new playlist name for track"""
     playlist_name = update.message.text.strip()
@@ -4095,8 +4806,23 @@ async def download_track_to_playlist(update: Update, context: ContextTypes.DEFAU
     await message_method(download_message, parse_mode=ParseMode.MARKDOWN)
 
     try:
-        # Download the track
-        download_success = await api_client.download_song(track_info, file_path)
+        # Check if a specific YouTube video was selected for this track
+        selected_video = context.user_data.get('selected_youtube_video')
+        if selected_video and EZCONV_AVAILABLE:
+            # Use the selected YouTube video for download
+            youtube_url = selected_video['youtube_url']
+            from ezconv_downloader import download_youtube_with_ezconv
+
+            download_logger.info(f"🎯 Using manually selected YouTube video: {youtube_url}")
+            result = await download_youtube_with_ezconv(youtube_url, file_path)
+            download_success = result and result.get('success', False)
+
+            # Clean up the selected video from context
+            context.user_data.pop('selected_youtube_video', None)
+            context.user_data.pop('youtube_video_options', None)
+        else:
+            # Use regular download method
+            download_success = await api_client.download_song(track_info, file_path)
 
         if download_success and file_path.exists():
             success_message = f"✅ *Track Downloaded Successfully!*\n\n"
