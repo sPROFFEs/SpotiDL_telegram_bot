@@ -11,3 +11,8 @@ spotdl>=4.4.0
 # EzconvDownloader Dependencies
 # aiohttp (already included above)
 # brotli (already included above)
+
+# CustomConverter Dependencies
+spotipy>=2.25.1
+ytmusicapi>=1.11.1
+beautifulsoup4>=4.12.3

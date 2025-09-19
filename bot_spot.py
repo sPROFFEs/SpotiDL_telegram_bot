@@ -45,6 +45,13 @@ try:
 except ImportError:
     TUBETIFY_AVAILABLE = False
 
+# --- CUSTOM CONVERTER ---
+try:
+    from custom_converter import spotify_to_youtube_custom, get_youtube_for_spotify_custom
+    CUSTOM_CONVERTER_AVAILABLE = True
+except ImportError:
+    CUSTOM_CONVERTER_AVAILABLE = False
+
 # --- CONFIGURATION ---
 TELEGRAM_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN_HERE' # Replace with your actual bot token
 DB_FILE = Path('playlist_db.json')
@@ -97,6 +104,12 @@ if TUBETIFY_AVAILABLE:
     logger.info("✅ Tubetify Spotify→YouTube converter disponible")
 else:
     logger.warning("⚠️ Tubetify converter no disponible - instalar beautifulsoup4")
+
+# Log Custom converter availability
+if CUSTOM_CONVERTER_AVAILABLE:
+    logger.info("✅ Custom Spotify→YouTube converter disponible")
+else:
+    logger.warning("⚠️ Custom converter no disponible - instalar spotipy y ytmusicapi")
 
 # Additional loggers for different components
 sync_logger = logging.getLogger('sync')
@@ -2404,46 +2417,74 @@ class SpotDownAPI:
         preferred_method = settings.get('download_method', 'spotdown')
 
         # NEW PRIMARY METHOD: Tubetify + Ezconv (Spotify → YouTube → Download)
+        youtube_videos = []
+        converter_used = "None"
+
+        # Try Tubetify first
         if TUBETIFY_AVAILABLE and EZCONV_AVAILABLE:
             download_logger.info(f"🔄 Trying Tubetify→Ezconv as primary method for: {song_title}")
             try:
-                # Step 1: Convert Spotify URL to YouTube URL
+                # Step 1: Convert Spotify URL to YouTube URL using Tubetify
                 youtube_videos = await spotify_to_youtube(song_url)
                 if youtube_videos:
-                    download_logger.info(f"🎯 Found {len(youtube_videos)} YouTube match(es)")
-
-                    # Use the first (best) match for automatic download
-                    best_match = youtube_videos[0]
-                    youtube_url = best_match['youtube_url']
-
-                    download_logger.info(f"Using best match: {youtube_url}")
-
-                    # Step 2: Download from YouTube using Ezconv
-                    result = await download_youtube_with_ezconv(youtube_url, download_path)
-                    if result and result.get('success'):
-                        download_logger.info(f"✅ Successfully downloaded {song_title} using Tubetify→Ezconv")
-                        return True
-                    else:
-                        download_logger.warning(f"Ezconv download failed for: {song_title}")
-
-                        # If first match fails and there are more options, could try others
-                        if len(youtube_videos) > 1:
-                            download_logger.info(f"Trying alternative matches ({len(youtube_videos)-1} remaining)")
-                            for i, video in enumerate(youtube_videos[1:], 2):
-                                try:
-                                    alt_url = video['youtube_url']
-                                    download_logger.info(f"Trying alternative {i}: {alt_url}")
-                                    result = await download_youtube_with_ezconv(alt_url, download_path)
-                                    if result and result.get('success'):
-                                        download_logger.info(f"✅ Successfully downloaded using alternative {i}")
-                                        return True
-                                except Exception as e:
-                                    download_logger.warning(f"Alternative {i} failed: {e}")
+                    converter_used = "Tubetify"
+                    download_logger.info(f"🎯 Tubetify found {len(youtube_videos)} YouTube match(es)")
                 else:
-                    download_logger.warning(f"No YouTube match found for: {song_title}")
+                    download_logger.warning(f"Tubetify found no matches for: {song_title}")
             except Exception as e:
-                download_logger.error(f"Tubetify→Ezconv method error: {e}")
+                download_logger.error(f"Tubetify method error: {e}")
 
+        # Try Custom converter as fallback if Tubetify failed
+        if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE and EZCONV_AVAILABLE:
+            download_logger.info(f"🔄 Trying Custom→Ezconv as fallback method for: {song_title}")
+            try:
+                # Step 1: Convert Spotify URL to YouTube URL using Custom converter
+                from custom_converter import spotify_to_youtube_custom
+                youtube_videos = await spotify_to_youtube_custom(song_url)
+                if youtube_videos:
+                    converter_used = "Custom"
+                    download_logger.info(f"🎯 Custom converter found {len(youtube_videos)} YouTube match(es)")
+                else:
+                    download_logger.warning(f"Custom converter found no matches for: {song_title}")
+            except Exception as e:
+                download_logger.error(f"Custom converter method error: {e}")
+
+        # If we have YouTube videos, try to download them
+        if youtube_videos and EZCONV_AVAILABLE:
+            download_logger.info(f"Using converter: {converter_used}")
+
+            # Use the first (best) match for automatic download
+            best_match = youtube_videos[0]
+            youtube_url = best_match['youtube_url']
+
+            download_logger.info(f"Using best match: {youtube_url}")
+
+            # Step 2: Download from YouTube using Ezconv
+            result = await download_youtube_with_ezconv(youtube_url, download_path)
+            if result and result.get('success'):
+                download_logger.info(f"✅ Successfully downloaded {song_title} using {converter_used}→Ezconv")
+                return True
+            else:
+                download_logger.warning(f"Ezconv download failed for: {song_title}")
+
+                # If first match fails and there are more options, try others
+                if len(youtube_videos) > 1:
+                    download_logger.info(f"Trying alternative matches ({len(youtube_videos)-1} remaining)")
+                    for i, video in enumerate(youtube_videos[1:], 2):
+                        try:
+                            alt_url = video['youtube_url']
+                            download_logger.info(f"Trying alternative {i}: {alt_url}")
+                            result = await download_youtube_with_ezconv(alt_url, download_path)
+                            if result and result.get('success'):
+                                download_logger.info(f"✅ Successfully downloaded using alternative {i}")
+                                return True
+                        except Exception as e:
+                            download_logger.warning(f"Alternative {i} failed: {e}")
+
+        if not youtube_videos:
+            download_logger.warning(f"No YouTube matches found using any converter for: {song_title}")
+
+        # Continue with SpotDL and other fallback methods
         # If user prefers SpotDL and it's available, try it as fallback
         if preferred_method == 'spotdl' and SPOTDL_AVAILABLE:
             download_logger.info(f"🎵 Trying SpotDL as fallback method for: {song_title}")
@@ -3904,44 +3945,72 @@ async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     context.user_data['track_info'] = track_info
     context.user_data['track_info']['url'] = track_url
 
-    # Check for multiple YouTube video options if Tubetify is available
+    # Check for multiple YouTube video options
+    youtube_videos = []
+    converter_used = "None"
+
+    # Try Tubetify first
     if TUBETIFY_AVAILABLE and EZCONV_AVAILABLE:
-        await sent_message.edit_text("🔍 Searching for YouTube matches...")
+        await sent_message.edit_text("🔍 Searching for YouTube matches (Tubetify)...")
         try:
             from tubetify_converter import spotify_to_youtube
             youtube_videos = await spotify_to_youtube(track_url)
-
-            if len(youtube_videos) > 1:
-                # Store video options for manual selection
-                context.user_data['youtube_video_options'] = youtube_videos
-
-                # Show video selection menu
-                message = f"🎵 *Track Found*\n\n"
-                message += f"**Title:** {track_info['title']}\n"
-                message += f"**Artist:** {track_info['artist']}\n\n"
-                message += f"🎯 Found {len(youtube_videos)} YouTube matches. Choose the best one:\n\n"
-
-                keyboard = []
-                for i, video in enumerate(youtube_videos[:5]):  # Limit to 5 options
-                    video_title = video.get('video_found', video.get('title', 'Unknown'))
-                    if len(video_title) > 40:
-                        video_title = video_title[:37] + "..."
-                    keyboard.append([InlineKeyboardButton(
-                        f"🎬 {i+1}. {video_title}",
-                        callback_data=f'select_youtube_video_{i}'
-                    )])
-
-                keyboard.append([InlineKeyboardButton("🔄 Auto-select Best Match", callback_data='auto_select_youtube')])
-                keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')])
-
-                await sent_message.edit_text(
-                    message,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                return
+            if youtube_videos:
+                converter_used = "Tubetify"
+                logger.info(f"✅ Tubetify found {len(youtube_videos)} video(s)")
         except Exception as e:
-            logger.warning(f"Error getting YouTube options: {e}")
+            logger.warning(f"Tubetify error: {e}")
+
+    # Try Custom converter as fallback if Tubetify failed or unavailable
+    if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE and EZCONV_AVAILABLE:
+        await sent_message.edit_text("🔍 Searching for YouTube matches (Custom)...")
+        try:
+            from custom_converter import spotify_to_youtube_custom
+            youtube_videos = await spotify_to_youtube_custom(track_url)
+            if youtube_videos:
+                converter_used = "Custom"
+                logger.info(f"✅ Custom converter found {len(youtube_videos)} video(s)")
+        except Exception as e:
+            logger.warning(f"Custom converter error: {e}")
+
+    # If we found multiple videos, show selection menu
+    if len(youtube_videos) > 1:
+        # Store video options for manual selection
+        context.user_data['youtube_video_options'] = youtube_videos
+        context.user_data['converter_used'] = converter_used
+
+        # Show video selection menu
+        message = f"🎵 *Track Found*\n\n"
+        message += f"**Title:** {track_info['title']}\n"
+        message += f"**Artist:** {track_info['artist']}\n\n"
+        message += f"🎯 Found {len(youtube_videos)} YouTube matches ({converter_used}). Choose the best one:\n\n"
+
+        keyboard = []
+        for i, video in enumerate(youtube_videos[:5]):  # Limit to 5 options
+            video_title = video.get('video_found', video.get('title', 'Unknown'))
+            if len(video_title) > 40:
+                video_title = video_title[:37] + "..."
+            keyboard.append([InlineKeyboardButton(
+                f"🎬 {i+1}. {video_title}",
+                callback_data=f'select_youtube_video_{i}'
+            )])
+
+        keyboard.append([InlineKeyboardButton("🔄 Auto-select Best Match", callback_data='auto_select_youtube')])
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')])
+
+        await sent_message.edit_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
+    elif len(youtube_videos) == 1:
+        # Single match found, store it for automatic use
+        context.user_data['selected_youtube_video'] = youtube_videos[0]
+        context.user_data['converter_used'] = converter_used
+        logger.info(f"Single match found using {converter_used}, will use automatically")
+    else:
+        logger.warning("No YouTube matches found with any converter")
 
     # Show track info and ask for playlist selection (default behavior)
     message = f"🎵 *Track Found*\n\n"

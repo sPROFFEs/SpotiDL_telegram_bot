@@ -79,19 +79,87 @@ The bot downloads all music to: **`/music/local/`**
 - Linux/macOS (recommended) or Windows
 - Write access to `/music/local/` directory
 
-### **1. Clone Repository**
+### **🚀 Quick Setup (Recommended)**
+
+**Use the automated setup script for easy installation:**
+
 ```bash
 git clone <repository-url>
 cd SpotiDL_telegram_bot
+./setup.sh
 ```
 
-### **2. Install Dependencies**
+The setup script will:
+- ✅ Check Python version and create virtual environment
+- ✅ Install all dependencies automatically
+- ✅ Set up music directories with proper permissions
+- ✅ Configure Spotify API credentials (optional but recommended)
+- ✅ Set up Telegram bot token
+- ✅ Create startup scripts and systemd service
+- ✅ Test the installation
+
+### **🔑 Spotify API Setup (Highly Recommended)**
+
+For the best Custom Converter results, configure Spotify API credentials:
+
+1. **Get Spotify API Credentials:**
+   - Go to [Spotify Developer Dashboard](https://developer.spotify.com/dashboard)
+   - Create a new app (name: "SpotiDL Bot")
+   - Copy Client ID and Client Secret
+
+2. **Configure during setup:**
+   - The setup script will ask for your credentials
+   - Or manually edit `.env` file:
+   ```bash
+   SPOTIPY_CLIENT_ID=your_client_id_here
+   SPOTIPY_CLIENT_SECRET=your_client_secret_here
+   ```
+
+### **📱 Telegram Bot Setup**
+
+1. **Create Telegram Bot:**
+   - Message [@BotFather](https://t.me/BotFather) on Telegram
+   - Send: `/newbot`
+   - Choose name and username
+   - Copy the bot token
+
+2. **Configure during setup:**
+   - The setup script will ask for your token
+   - Or manually edit `bot_spot.py`
+
+### **🔧 Manual Installation (Alternative)**
+
+If you prefer manual setup:
+
 ```bash
+# 1. Clone and navigate
+git clone <repository-url>
+cd SpotiDL_telegram_bot
+
+# 2. Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# 3. Install dependencies
 pip install -r requirements.txt
 playwright install chromium
+
+# 4. Create directories
+sudo mkdir -p /music/local
+sudo chown $USER:$USER /music/local
+
+# 5. Configure credentials (optional)
+echo "SPOTIPY_CLIENT_ID=your_id" > .env
+echo "SPOTIPY_CLIENT_SECRET=your_secret" >> .env
+
+# 6. Set bot token
+sed -i "s/YOUR_TELEGRAM_BOT_TOKEN_HERE/your_bot_token/" bot_spot.py
+
+# 7. Run bot
+python3 bot_spot.py
 ```
 
-**Dependencies include**:
+**Dependencies automatically installed:**
 - `python-telegram-bot` - Telegram bot framework
 - `playwright` - Browser automation for web scraping
 - `aiohttp` - Async HTTP client for new download methods
@@ -99,37 +167,20 @@ playwright install chromium
 - `yt-dlp` - YouTube downloading capabilities
 - `spotdl` - Fallback downloader with 95%+ success rate
 - `beautifulsoup4` - HTML parsing for video selection
+- `spotipy` - Spotify API client for Custom Converter
+- `ytmusicapi` - YouTube Music search for Custom Converter
 
-### **3. Optional: Install ffmpeg for Enhanced Integrity Checking**
+### **🎵 Starting the Bot**
+
+After setup completion:
+
 ```bash
-# Ubuntu/Debian
-sudo apt install ffmpeg
+# Using the startup script
+./start_bot.sh
 
-# macOS with Homebrew
-brew install ffmpeg
-
-# Windows - Download from https://ffmpeg.org/
-```
-
-### **4. Create Telegram Bot**
-1. Message [@BotFather](https://t.me/BotFather) on Telegram
-2. Create a new bot with `/newbot`
-3. Copy the bot token
-
-### **5. Configure Bot**
-Edit `bot_spot.py` and replace:
-```python
-TELEGRAM_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN_HERE'
-```
-
-### **6. Set Up Directory**
-```bash
-sudo mkdir -p /music/local
-sudo chown $USER:$USER /music/local
-```
-
-### **7. Run Bot**
-```bash
+# Or manually
+source venv/bin/activate
+export $(cat .env | grep -v '^#' | xargs)  # Load env vars
 python3 bot_spot.py
 ```
 
@@ -231,26 +282,34 @@ Configure automatic playlist updates:
 - **Spotify Integration**: Direct API access with browser-simulated token acquisition
 
 ### **Enhanced Download Strategy**
-The bot implements a robust 4-layer fallback download system:
+The bot implements a robust 5-layer fallback download system:
 
-1. **🥇 Primary: Tubetify → Ezconv** *(NEW)*
+1. **🥇 Primary: Tubetify → Ezconv**
    - Converts Spotify URLs to YouTube URLs via tubetify.com
    - Downloads high-quality MP3 from YouTube via ezconv.com API
    - **Manual Video Selection**: Choose from multiple YouTube matches
    - **Auto-Selection**: Intelligent best-match selection
-   - **95%+ Success Rate**: Most reliable method for current conditions
+   - **External Service**: Relies on tubetify.com availability
 
-2. **🥈 Secondary: SpotDL** *(User Preference)*
+2. **🥈 Secondary: Custom Converter → Ezconv** *(NEW - Self-Hosted)*
+   - **Self-hosted Spotify→YouTube conversion** using our own implementation
+   - Uses Spotify API for precise track information (when configured)
+   - YouTube Music search via ytmusicapi for accurate results
+   - **Web scraping fallback** when API credentials not available
+   - **No external dependencies** - fully self-contained
+   - **Better accuracy** with proper Spotify API credentials
+
+3. **🥉 Tertiary: SpotDL** *(User Preference)*
    - Only if user sets `preferred_method = 'spotdl'` in settings
    - YouTube-based download via [spotDL](https://github.com/spotDL/spotify-downloader)
-   - Activated as fallback when primary method fails
+   - Activated as fallback when primary methods fail
 
-3. **🥉 Tertiary: SpotDown API** *(Original Method)*
+4. **🔄 Quaternary: SpotDown API** *(Original Method)*
    - Legacy spotdown.app API with enhanced proxy support
    - Browser automation for token acquisition
    - Multiple proxy rotation with intelligent caching
 
-4. **🔄 Quaternary: SpotDL Final Fallback**
+5. **🆘 Final: SpotDL Fallback**
    - Last resort SpotDL usage when all other methods fail
    - Ensures maximum download success rate
 
@@ -260,6 +319,18 @@ The bot implements a robust 4-layer fallback download system:
 - **Playlist Integration**: Add YouTube videos to existing playlists
 - **Auto-Title Detection**: Intelligent filename generation from video metadata
 - **Quality Optimization**: 320kbps MP3 extraction with proper metadata
+
+### **Custom Converter Features** *(Self-Hosted Solution)*
+- **🏠 Self-Hosted**: No reliance on external conversion services
+- **🔑 Spotify API Integration**: Precise track info extraction (when configured)
+- **🎵 YouTube Music Search**: High-quality music-specific search results
+- **🔄 Web Scraping Fallback**: Works without API credentials (reduced accuracy)
+- **⚡ Async Performance**: Fully asynchronous implementation
+- **🔍 Smart Parsing**: Multiple strategies for track information extraction
+- **🐛 Error Resilience**: Graceful handling of API failures and rate limits
+- **📊 Better Accuracy**: Superior results when Spotify API is configured
+
+**🙏 Credits**: Custom Converter is based on the excellent [yt2spotify](https://github.com/omijn/yt2spotify) project by [@omijn](https://github.com/omijn), adapted for our Telegram bot integration with additional async support and fallback mechanisms.
 
 ### **Enhanced Proxy System**
 - **Smart Rotation**: Automatic proxy switching with performance tracking
@@ -306,9 +377,34 @@ The bot implements a robust 4-layer fallback download system:
 
 ### **Migration Notes**
 - All existing playlists and settings are preserved
-- New download method is automatically used for new downloads
+- New Custom Converter automatically activates as Tubetify fallback
 - Existing SpotDL fallback functionality is enhanced
-- Manual video selection is optional - auto-selection available
+- Manual video selection works with both Tubetify and Custom Converter
+- Spotify API configuration is optional but highly recommended
+
+### **Custom Converter Configuration**
+
+**🔑 Recommended: Spotify API Setup**
+```bash
+# Run setup script (recommended)
+./setup.sh
+
+# Or manually create .env file
+echo "SPOTIPY_CLIENT_ID=your_client_id" > .env
+echo "SPOTIPY_CLIENT_SECRET=your_client_secret" >> .env
+```
+
+**⚙️ Without API Credentials:**
+- Custom Converter will use web scraping fallback
+- Reduced accuracy but still functional
+- No additional setup required
+
+**📋 Benefits of API Configuration:**
+- ✅ Precise track, artist, and album information
+- ✅ Better YouTube Music search accuracy
+- ✅ Higher success rate for obscure tracks
+- ✅ Proper metadata handling
+- ✅ No rate limiting issues
 
 ## 🤝 **Contributing**
 
@@ -327,6 +423,26 @@ This project is provided as-is for educational purposes. Users are responsible f
 - **Issues**: Report bugs via GitHub Issues
 - **Documentation**: Check this README and code comments
 - **Logs**: Always check log files for debugging information
+
+## 🙏 **Credits & Acknowledgments**
+
+### **Open Source Projects Used:**
+- **[yt2spotify](https://github.com/omijn/yt2spotify)** by [@omijn](https://github.com/omijn) - Core inspiration and architecture for our Custom Converter implementation
+- **[spotDL](https://github.com/spotDL/spotify-downloader)** - YouTube-based music downloader used as fallback
+- **[python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot)** - Telegram Bot API wrapper
+- **[playwright](https://github.com/microsoft/playwright-python)** - Browser automation for web scraping
+- **[spotipy](https://github.com/spotipy-dev/spotipy)** - Spotify Web API wrapper
+- **[ytmusicapi](https://github.com/sigma67/ytmusicapi)** - YouTube Music API client
+
+### **External Services:**
+- **[tubetify.com](https://tubetify.com)** - Primary Spotify→YouTube conversion service
+- **[ezconv.com](https://ezconv.com)** - YouTube audio extraction service
+- **[spotdown.app](https://spotdown.app)** - Original Spotify download API
+
+### **Special Thanks:**
+- **[@omijn](https://github.com/omijn)** for the excellent yt2spotify project that served as the foundation for our Custom Converter
+- All contributors to the open source projects that make this bot possible
+- The Spotify and YouTube communities for their APIs and documentation
 
 ---
 
