@@ -318,7 +318,21 @@ def sanitize_filename(name: str) -> str:
 
 # --- SONG INTEGRITY CHECKER ---
 async def check_song_integrity(file_path: Path, expected_duration: str) -> bool:
-    """Check if a song file is complete by file size and basic validation"""
+    """Check if a song file is complete and not corrupted
+
+    Enhanced for YouTube downloads which may have different durations:
+    - Uses intelligent tolerance for duration differences (35-50% depending on song length)
+    - Distinguishes between corrupted files and different versions
+    - Focuses on detecting truly broken files rather than alternative versions
+    - Considers download source for more accurate validation
+
+    Args:
+        file_path: Path to the audio file
+        expected_duration: Expected duration in 'MM:SS' format
+
+    Returns:
+        bool: True if file appears valid, False if likely corrupted
+    """
     try:
         if not file_path.exists():
             return False
@@ -326,9 +340,10 @@ async def check_song_integrity(file_path: Path, expected_duration: str) -> bool:
         # Get file size
         file_size = file_path.stat().st_size
 
-        # Very small files are likely corrupted (less than 100KB for any song is suspicious)
-        if file_size < 100 * 1024:  # 100KB
-            logger.info(f"File too small - {file_path.name}: {file_size} bytes")
+        # Very small files are likely corrupted (less than 500KB for any song is suspicious)
+        min_file_size = 500 * 1024  # Increased from 100KB to 500KB for YouTube downloads
+        if file_size < min_file_size:
+            logger.warning(f"File too small (likely corrupted) - {file_path.name}: {file_size} bytes (minimum: {min_file_size})")
             return False
 
         # Parse expected duration to estimate minimum expected file size
@@ -339,13 +354,14 @@ async def check_song_integrity(file_path: Path, expected_duration: str) -> bool:
                 expected_seconds = int(duration_parts[1])
                 expected_total_seconds = expected_minutes * 60 + expected_seconds
 
-                # Estimate minimum file size based on duration
-                # Assuming very low quality MP3 (32kbps) as minimum
-                min_bitrate_kbps = 32
+                # Estimate minimum file size based on duration (very conservative)
+                # Using 64kbps as minimum reasonable quality for modern downloads
+                min_bitrate_kbps = 64
                 estimated_min_size = (expected_total_seconds * min_bitrate_kbps * 1024) // 8
 
-                if file_size < estimated_min_size * 0.5:  # 50% tolerance
-                    logger.info(f"File size too small for duration - {file_path.name}: {file_size} bytes for {expected_total_seconds}s")
+                # Only flag as corrupted if significantly smaller than expected
+                if file_size < estimated_min_size * 0.3:  # Very conservative 30% threshold
+                    logger.warning(f"File significantly undersized (likely corrupted) - {file_path.name}: {file_size} bytes for {expected_total_seconds}s (expected minimum: {estimated_min_size * 0.3:.0f})")
                     return False
 
             except (ValueError, IndexError):
@@ -368,36 +384,70 @@ async def check_song_integrity(file_path: Path, expected_duration: str) -> bool:
                     expected_seconds = int(duration_parts[1])
                     expected_total_seconds = expected_minutes * 60 + expected_seconds
 
-                    # Allow 15% tolerance for duration differences
-                    tolerance = max(5, expected_total_seconds * 0.15)
+                    # Intelligent tolerance calculation for YouTube downloads
+                    # YouTube often has different versions (extended, live, remixes, etc.)
+
+                    # Base tolerance: larger for longer songs
+                    if expected_total_seconds < 120:  # Songs under 2 minutes
+                        tolerance_percentage = 0.50  # 50% tolerance
+                    elif expected_total_seconds < 300:  # Songs under 5 minutes
+                        tolerance_percentage = 0.40  # 40% tolerance
+                    else:  # Longer songs
+                        tolerance_percentage = 0.35  # 35% tolerance
+
+                    # Minimum tolerance of 15 seconds
+                    tolerance = max(15, expected_total_seconds * tolerance_percentage)
                     duration_diff = abs(actual_duration - expected_total_seconds)
 
-                    is_valid = duration_diff <= tolerance
+                    # Check if file is suspiciously short (likely corrupted)
+                    is_too_short = actual_duration < expected_total_seconds * 0.5
+
+                    # Check if file is way too long (likely wrong song or compilation)
+                    is_too_long = actual_duration > expected_total_seconds * 3
+
+                    # File is invalid only if clearly corrupted or completely wrong
+                    is_valid = not (is_too_short or is_too_long)
 
                     if not is_valid:
-                        logger.info(f"Duration mismatch - {file_path.name}: expected {expected_total_seconds}s, got {actual_duration}s")
+                        if is_too_short:
+                            logger.warning(f"Possibly corrupted (too short) - {file_path.name}: expected {expected_total_seconds}s, got {actual_duration:.1f}s")
+                        elif is_too_long:
+                            logger.info(f"Possibly wrong track (too long) - {file_path.name}: expected {expected_total_seconds}s, got {actual_duration:.1f}s")
+                    elif duration_diff > tolerance:
+                        # Log as info but don't mark as invalid (different version, not corrupted)
+                        percentage_diff = (duration_diff / expected_total_seconds) * 100
+                        logger.info(f"Different version detected - {file_path.name}: expected {expected_total_seconds}s, got {actual_duration:.1f}s ({percentage_diff:.1f}% difference)")
+                        # Still consider valid since it's likely just a different version
+                        is_valid = True
 
                     return is_valid
 
-        except (FileNotFoundError, subprocess.SubprocessError):
-            # ffprobe not available, rely on file size check
-            pass
+        except (FileNotFoundError, subprocess.SubprocessError, subprocess.TimeoutExpired):
+            # ffprobe not available or failed, rely on file size and header check
+            logger.debug(f"ffprobe not available for {file_path.name}, using basic validation")
 
         # If we can't use ffprobe, check if the file is a valid audio file by reading its header
         try:
             with open(file_path, 'rb') as f:
-                header = f.read(10)
+                header = f.read(16)  # Read more bytes for better detection
 
             # Check for common audio file headers
-            if header.startswith(b'ID3') or header[0:2] == b'\xff\xfb' or header[0:3] == b'TAG':
-                # Looks like a valid MP3 file
+            is_mp3 = header.startswith(b'ID3') or header[0:2] == b'\xff\xfb' or header[0:2] == b'\xff\xfa'
+            is_mp4 = header[4:8] == b'ftyp'
+            is_ogg = header.startswith(b'OggS')
+            is_flac = header.startswith(b'fLaC')
+
+            if is_mp3 or is_mp4 or is_ogg or is_flac:
+                # Looks like a valid audio file
+                logger.debug(f"Valid audio header detected - {file_path.name}")
                 return True
             else:
-                logger.info(f"Invalid audio header - {file_path.name}")
+                logger.warning(f"Invalid or unrecognized audio header - {file_path.name}")
                 return False
 
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Error reading file header for {file_path.name}: {e}")
+            return False
 
         # If all checks pass and we can't verify otherwise, assume valid
         return True
@@ -450,7 +500,12 @@ async def check_playlist_integrity(playlist_id: str, playlist_data: dict) -> dic
                 'song_data': song
             })
 
-    logger.info(f"Integrity check completed for {playlist_name}: {result['valid_songs']}/{result['checked_songs']} valid, {len(result['corrupted_songs'])} corrupted, {len(result['missing_songs'])} missing")
+    # Calculate statistics
+    total_issues = len(result['corrupted_songs']) + len(result['missing_songs'])
+    if total_issues == 0:
+        logger.info(f"Integrity check completed for {playlist_name}: ✅ All {result['valid_songs']} songs are valid")
+    else:
+        logger.info(f"Integrity check completed for {playlist_name}: {result['valid_songs']}/{result['checked_songs']} valid, {len(result['corrupted_songs'])} potentially corrupted, {len(result['missing_songs'])} missing")
 
     return result
 
@@ -677,6 +732,7 @@ class PlaylistSyncManager:
             synced_count = 0
             error_count = 0
             new_songs_count = 0
+            playlists_with_new_songs = []  # Store detailed info about playlists with new songs
 
             sync_logger.info(f"Found {total_in_db} total playlists, {total_playlists} syncable (excluding custom playlists)")
 
@@ -726,6 +782,14 @@ class PlaylistSyncManager:
                     if new_songs:
                         sync_logger.info(f"Found {len(new_songs)} new songs in {playlist_name}")
 
+                        # Store detailed information about this playlist
+                        playlists_with_new_songs.append({
+                            'id': playlist_id,
+                            'name': playlist_name,
+                            'new_songs_count': len(new_songs),
+                            'new_songs': new_songs[:3]  # Store first 3 songs for preview
+                        })
+
                         # Download new songs and only add successful ones to database
                         settings = load_settings()
                         if settings.get('auto_download_new', False):
@@ -764,7 +828,8 @@ class PlaylistSyncManager:
                 'new_songs': new_songs_count,
                 'errors': error_count,
                 'total_in_db': total_in_db,
-                'custom_playlists': custom_playlists
+                'custom_playlists': custom_playlists,
+                'playlists_with_new_songs': playlists_with_new_songs
             }
 
         except Exception as e:
@@ -3241,25 +3306,161 @@ async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if result:
             message = f"""✅ *Sync Completed*
 
-*Total playlists in database:* {result['total_in_db']}
-*Syncable playlists:* {result['total']}
-*Custom playlists (excluded):* {result['custom_playlists']}
-*Successfully synced:* {result['synced']}/{result['total']}
-*New songs found:* {result['new_songs']}
-*Errors:* {result['errors']}"""
+📊 *Summary:*
+▪️ Total playlists in database: {result['total_in_db']}
+▪️ Syncable playlists: {result['total']}
+▪️ Custom playlists (excluded): {result['custom_playlists']}
+▪️ Successfully synced: {result['synced']}/{result['total']}
+▪️ New songs found: {result['new_songs']}
+▪️ Errors: {result['errors']}"""
+
+            keyboard = []
+
+            # Show playlists with new songs
+            playlists_with_new = result.get('playlists_with_new_songs', [])
+            if playlists_with_new:
+                message += f"\n\n🎵 *Playlists with new songs:*\n"
+
+                for playlist in playlists_with_new[:5]:  # Show first 5
+                    name = playlist['name']
+                    count = playlist['new_songs_count']
+
+                    # Preview of new songs
+                    preview_songs = []
+                    for song in playlist['new_songs']:
+                        artist = song.get('artist', 'Unknown')
+                        title = song.get('title', 'Unknown')
+                        preview_songs.append(f"{artist} - {title}")
+
+                    preview_text = ", ".join(preview_songs)
+                    if len(preview_text) > 60:
+                        preview_text = preview_text[:57] + "..."
+
+                    message += f"▪️ *{name}* ({count} new)\n"
+                    message += f"   __{preview_text}__\n"
+
+                    # Add resync button for this playlist
+                    keyboard.append([
+                        InlineKeyboardButton(
+                            f"🔄 Sync {name} ({count} songs)",
+                            callback_data=f"resync_playlist_{playlist['id']}"
+                        )
+                    ])
+
+                if len(playlists_with_new) > 5:
+                    message += f"▪️ ... and {len(playlists_with_new) - 5} more\n"
+
+            else:
+                message += f"\n\n✅ All playlists are up to date!"
+
         else:
             message = "❌ Sync failed. Check logs for details."
 
     except Exception as e:
         logger.error(f"Manual sync error: {e}")
         message = f"❌ Sync error: {str(e)}"
+        keyboard = []
 
-    keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data='main_menu')]]
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Menu", callback_data='main_menu')])
     await update.callback_query.edit_message_text(
         message,
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=ParseMode.MARKDOWN
     )
+
+async def resync_individual_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str):
+    """Resync a specific playlist and download new songs"""
+    db = load_db()
+    if playlist_id not in db:
+        await update.callback_query.edit_message_text("❌ Playlist not found.")
+        return
+
+    playlist_data = db[playlist_id]
+    playlist_name = playlist_data.get('name', 'Unknown')
+    playlist_url = playlist_data.get('url', '')
+    is_custom = playlist_data.get('is_custom', False)
+
+    if is_custom or not playlist_url:
+        await update.callback_query.edit_message_text("❌ Cannot sync custom playlists - they don't have a Spotify URL.")
+        return
+
+    await update.callback_query.edit_message_text(f"🔄 Syncing playlist '{playlist_name}'...")
+
+    try:
+        # Get current online playlist data
+        online_data = await api_client.get_playlist_details(playlist_url)
+        if not online_data or 'songs' not in online_data:
+            await update.callback_query.edit_message_text("❌ Could not fetch updated playlist data.")
+            return
+
+        online_songs = online_data['songs']
+        saved_songs = playlist_data.get('songs', [])
+
+        # Find new songs by comparing URLs AND checking if files actually exist
+        playlist_dir = MUSIC_DIR / playlist_name
+        saved_urls = set()
+
+        # Only consider songs as "saved" if they exist both in JSON AND on disk
+        for song in saved_songs:
+            song_url = song.get('url', '')
+            if song_url:
+                # Check if file actually exists
+                song_title = sanitize_filename(song.get('title', 'Unknown'))
+                artist_name = sanitize_filename(song.get('artist', 'Unknown'))
+                file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
+
+                if file_path.exists():
+                    saved_urls.add(song_url)
+                else:
+                    logger.info(f"File missing for '{song_title}' - will be re-downloaded")
+
+        new_songs = [song for song in online_songs if song.get('url', '') not in saved_urls]
+
+        if not new_songs:
+            message = f"✅ *{playlist_name}*\n\nNo new songs found. Playlist is up to date!"
+        else:
+            # Download new songs
+            await update.callback_query.edit_message_text(f"🔄 Downloading {len(new_songs)} new songs from '{playlist_name}'...")
+
+            successfully_downloaded = await sync_manager._download_new_songs(new_songs, playlist_data, playlist_id)
+
+            # Add successfully downloaded songs to database
+            playlist_data['songs'].extend(successfully_downloaded)
+            db[playlist_id] = playlist_data
+            save_db(db)
+
+            if successfully_downloaded:
+                message = f"✅ *{playlist_name}* - Sync Complete\n\n"
+                message += f"📊 *Results:*\n"
+                message += f"▪️ New songs found: {len(new_songs)}\n"
+                message += f"▪️ Successfully downloaded: {len(successfully_downloaded)}\n"
+                message += f"▪️ Failed downloads: {len(new_songs) - len(successfully_downloaded)}\n"
+
+                if successfully_downloaded:
+                    message += f"\n🎵 *Downloaded songs:*\n"
+                    for i, song in enumerate(successfully_downloaded[:5]):  # Show first 5
+                        artist = song.get('artist', 'Unknown')
+                        title = song.get('title', 'Unknown')
+                        message += f"▪️ {artist} - {title}\n"
+
+                    if len(successfully_downloaded) > 5:
+                        message += f"▪️ ... and {len(successfully_downloaded) - 5} more\n"
+            else:
+                message = f"❌ *{playlist_name}*\n\nFound {len(new_songs)} new songs but failed to download any. Check logs for details."
+
+        keyboard = [[InlineKeyboardButton("⬅️ Back to Menu", callback_data='main_menu')]]
+        await update.callback_query.edit_message_text(
+            message,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+    except Exception as e:
+        logger.error(f"Error syncing playlist {playlist_name}: {e}")
+        await update.callback_query.edit_message_text(
+            f"❌ Error syncing playlist: {str(e)}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data='main_menu')]])
+        )
 
 async def perform_integrity_check(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str):
     """Check integrity of a specific playlist"""
@@ -3280,7 +3481,7 @@ async def perform_integrity_check(update: Update, context: ContextTypes.DEFAULT_
         message += f"📊 *Results:*\n"
         message += f"▪️ Total songs: {result['total_songs']}\n"
         message += f"▪️ Valid songs: {result['valid_songs']}\n"
-        message += f"▪️ Corrupted songs: {len(result['corrupted_songs'])}\n"
+        message += f"▪️ Quality issues: {len(result['corrupted_songs'])}\n"
         message += f"▪️ Missing songs: {len(result['missing_songs'])}\n"
 
         keyboard = []
@@ -3291,7 +3492,7 @@ async def perform_integrity_check(update: Update, context: ContextTypes.DEFAULT_
 
             # Show details of corrupted/missing songs
             if result['corrupted_songs']:
-                message += f"\n⚠️ *Corrupted songs:*\n"
+                message += f"\n⚠️ *Songs with quality issues:*\n"
                 for i, song in enumerate(result['corrupted_songs'][:5]):  # Show first 5
                     message += f"▪️ {song['artist']} - {song['title']}\n"
                 if len(result['corrupted_songs']) > 5:
@@ -3423,13 +3624,13 @@ async def check_all_playlists_integrity(update: Update, context: ContextTypes.DE
         message += f"▪️ Playlists checked: {total_playlists}\n"
         message += f"▪️ Total songs: {total_songs}\n"
         message += f"▪️ Valid songs: {total_valid}\n"
-        message += f"▪️ Corrupted songs: {total_corrupted}\n"
+        message += f"▪️ Quality issues: {total_corrupted}\n"
         message += f"▪️ Missing songs: {total_missing}\n"
 
         if playlists_with_issues:
             message += f"\n⚠️ *Playlists with issues:*\n"
             for playlist in playlists_with_issues[:10]:  # Show first 10
-                message += f"▪️ {playlist['name']}: {playlist['corrupted']} corrupted, {playlist['missing']} missing\n"
+                message += f"▪️ {playlist['name']}: {playlist['corrupted']} quality issues, {playlist['missing']} missing\n"
 
         keyboard = [[InlineKeyboardButton("⬅️ Back to Playlists", callback_data='list_playlists_0')]]
 
@@ -3773,6 +3974,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await set_sync_day(update, context, day)
     elif data == 'manual_sync':
         await manual_sync(update, context)
+    elif data.startswith('resync_playlist_'):
+        playlist_id = data.split('resync_playlist_')[1]
+        await resync_individual_playlist(update, context, playlist_id)
     elif data == 'use_suggested_name':
         info = context.user_data['playlist_info']
         info['name'] = sanitize_filename(info['suggested_name'])
