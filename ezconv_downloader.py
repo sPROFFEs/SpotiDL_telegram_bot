@@ -40,6 +40,29 @@ class EzconvDownloader:
             'Priority': 'u=4'
         }
 
+    async def _make_request_with_ssl_fallback(self, method: str, url: str, **kwargs):
+        """Make HTTP request with SSL fallback if needed"""
+        try:
+            # First try with default SSL settings
+            async with aiohttp.ClientSession() as session:
+                async with session.request(method, url, **kwargs) as response:
+                    return response, await response.text() if response.content_type.startswith('text') else await response.read()
+        except aiohttp.ClientSSLError as e:
+            logger.warning(f"SSL error for {url}: {e}")
+            logger.info("Attempting request with SSL verification disabled...")
+            try:
+                # Fallback: Try with SSL verification disabled
+                connector = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.request(method, url, **kwargs) as response:
+                        return response, await response.text() if response.content_type.startswith('text') else await response.read()
+            except Exception as fallback_e:
+                logger.error(f"SSL fallback also failed for {url}: {fallback_e}")
+                raise fallback_e
+        except Exception as e:
+            logger.error(f"Request failed for {url}: {e}")
+            raise e
+
     async def get_country(self) -> Optional[str]:
         """Get country information from ezconv API"""
         try:
@@ -145,7 +168,8 @@ class EzconvDownloader:
             return None
 
     async def download_audio(self, download_url: str, output_path: Path) -> bool:
-        """Download audio file from the provided URL"""
+        """Download audio file from the provided URL with SSL fallback"""
+        # First try with default SSL settings
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
@@ -168,6 +192,37 @@ class EzconvDownloader:
                     else:
                         logger.error(f"Download failed with status {response.status}")
                         return False
+        except aiohttp.ClientSSLError as e:
+            logger.warning(f"SSL error encountered: {e}")
+            logger.info("Attempting download with SSL verification disabled...")
+
+            # Fallback: Try with SSL verification disabled
+            try:
+                connector = aiohttp.TCPConnector(ssl=False)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.get(
+                        download_url,
+                        timeout=aiohttp.ClientTimeout(total=300)
+                    ) as response:
+                        if response.status == 200:
+                            output_path.parent.mkdir(parents=True, exist_ok=True)
+
+                            with open(output_path, 'wb') as f:
+                                async for chunk in response.content.iter_chunked(8192):
+                                    f.write(chunk)
+
+                            if output_path.exists() and output_path.stat().st_size > 0:
+                                logger.info(f"Successfully downloaded with SSL fallback: {output_path}")
+                                return True
+                            else:
+                                logger.error("Downloaded file is empty or not created (SSL fallback)")
+                                return False
+                        else:
+                            logger.error(f"Download failed with status {response.status} (SSL fallback)")
+                            return False
+            except Exception as fallback_e:
+                logger.error(f"SSL fallback also failed: {fallback_e}")
+                return False
         except Exception as e:
             logger.error(f"Error downloading audio: {e}")
             return False

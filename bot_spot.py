@@ -59,6 +59,25 @@ MUSIC_DIR = Path('/music/local')
 LOGS_DIR = Path('logs')
 SETTINGS_FILE = Path('bot_settings.json')
 
+# --- DOWNLOAD METHODS CONFIGURATION ---
+DOWNLOAD_METHODS = {
+    'spotify_youtube_ezconv': {
+        'name': '🎯 Spotify→YouTube→Ezconv',
+        'available': lambda: TUBETIFY_AVAILABLE and EZCONV_AVAILABLE or CUSTOM_CONVERTER_AVAILABLE and EZCONV_AVAILABLE,
+        'description': 'Convert Spotify to YouTube, then download via Ezconv'
+    },
+    'spotdl': {
+        'name': '🎵 SpotDL',
+        'available': lambda: SPOTDL_AVAILABLE,
+        'description': 'Direct YouTube download via SpotDL'
+    },
+    'spotdown': {
+        'name': '🌐 SpotDown',
+        'available': lambda: True,  # Always available
+        'description': 'Original SpotDown.app API method'
+    }
+}
+
 # --- RETRY CONFIGURATION ---
 MAX_API_ATTEMPTS = 3       # Maximum attempts for API calls (reduced to prevent infinite loops)
 MAX_DOWNLOAD_ATTEMPTS = 2  # Try to download each song up to 2 times (reduced to prevent infinite loops)
@@ -298,6 +317,30 @@ def save_settings(settings):
     """Save bot settings to file"""
     with open(SETTINGS_FILE, 'w') as f:
         json.dump(settings, f, indent=4)
+
+def get_download_priority():
+    """Get current download methods priority order"""
+    settings = load_settings()
+    default_priority = ['spotify_youtube_ezconv', 'spotdl', 'spotdown']
+    return settings.get('download_priority', default_priority)
+
+def set_download_priority(new_priority):
+    """Set new download methods priority order"""
+    settings = load_settings()
+    settings['download_priority'] = new_priority
+    save_settings(settings)
+
+def get_available_methods():
+    """Get list of currently available download methods"""
+    available = []
+    for method_id, method_info in DOWNLOAD_METHODS.items():
+        if method_info['available']():
+            available.append({
+                'id': method_id,
+                'name': method_info['name'],
+                'description': method_info['description']
+            })
+    return available
 
 def sanitize_filename(name: str) -> str:
     """Removes invalid characters from file/folder names."""
@@ -2467,8 +2510,122 @@ class SpotDownAPI:
             download_logger.error(f"Session download failed: {e}")
             return False
 
+    async def _try_spotify_youtube_ezconv(self, song_url: str, song_title: str, download_path: Path) -> bool:
+        """Try Spotify→YouTube→Ezconv method"""
+        youtube_videos = []
+        converter_used = "None"
+
+        # Try Tubetify first
+        if TUBETIFY_AVAILABLE and EZCONV_AVAILABLE:
+            download_logger.info(f"🔄 Trying Tubetify→Ezconv for: {song_title}")
+            try:
+                youtube_videos = await spotify_to_youtube(song_url)
+                if youtube_videos:
+                    converter_used = "Tubetify"
+                    download_logger.info(f"🎯 Tubetify found {len(youtube_videos)} YouTube match(es)")
+            except Exception as e:
+                download_logger.error(f"Tubetify method error: {e}")
+
+        # Try Custom converter if Tubetify failed
+        if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE and EZCONV_AVAILABLE:
+            download_logger.info(f"🔄 Trying Custom→Ezconv for: {song_title}")
+            try:
+                from custom_converter import spotify_to_youtube_custom
+                youtube_videos = await spotify_to_youtube_custom(song_url)
+                if youtube_videos:
+                    converter_used = "Custom"
+                    download_logger.info(f"🎯 Custom converter found {len(youtube_videos)} YouTube match(es)")
+            except Exception as e:
+                download_logger.error(f"Custom converter method error: {e}")
+
+        # If we have YouTube videos, try to download them
+        if youtube_videos and EZCONV_AVAILABLE:
+            download_logger.info(f"Using converter: {converter_used}")
+
+            # Try the first (best) match
+            best_match = youtube_videos[0]
+            youtube_url = best_match['youtube_url']
+            download_logger.info(f"Using best match: {youtube_url}")
+
+            result = await download_youtube_with_ezconv(youtube_url, download_path)
+            if result and result.get('success'):
+                download_logger.info(f"✅ Successfully downloaded {song_title} using {converter_used}→Ezconv")
+                return True
+
+            # Try alternative matches if available
+            if len(youtube_videos) > 1:
+                download_logger.info(f"Trying alternative matches ({len(youtube_videos)-1} remaining)")
+                for i, video in enumerate(youtube_videos[1:], 2):
+                    try:
+                        alt_url = video['youtube_url']
+                        download_logger.info(f"Trying alternative {i}: {alt_url}")
+                        result = await download_youtube_with_ezconv(alt_url, download_path)
+                        if result and result.get('success'):
+                            download_logger.info(f"✅ Successfully downloaded using alternative {i}")
+                            return True
+                    except Exception as e:
+                        download_logger.warning(f"Alternative {i} failed: {e}")
+
+        download_logger.warning(f"Spotify→YouTube→Ezconv method failed for: {song_title}")
+        return False
+
+    async def _try_spotdl(self, song_url: str, song_title: str, download_path: Path) -> bool:
+        """Try SpotDL method"""
+        if not SPOTDL_AVAILABLE:
+            download_logger.warning(f"SpotDL not available for: {song_title}")
+            return False
+
+        download_logger.info(f"🎵 Trying SpotDL for: {song_title}")
+        try:
+            success = await try_spotdl_fallback(song_url, download_path)
+            if success:
+                download_logger.info(f"✅ Successfully downloaded {song_title} using SpotDL")
+                return True
+            else:
+                download_logger.warning(f"SpotDL method failed for: {song_title}")
+                return False
+        except Exception as e:
+            download_logger.error(f"SpotDL method error: {e}")
+            return False
+
+    async def _try_spotdown(self, song_url: str, song_title: str, download_path: Path) -> bool:
+        """Try SpotDown API method"""
+        download_logger.info(f"🌐 Trying SpotDown API for: {song_title}")
+
+        for attempt in range(MAX_API_ATTEMPTS):
+            try:
+                await self._rate_limit()
+                download_logger.info(f"SpotDown attempt {attempt + 1}/{MAX_API_ATTEMPTS} for: {song_title}")
+
+                song_details = await self.get_song_details(song_url)
+                if not song_details:
+                    download_logger.warning(f"Failed to get song details on attempt {attempt + 1}")
+                    await self._handle_api_failure()
+                    continue
+
+                success = await self._download_with_session(song_url, download_path, song_title)
+                if success:
+                    download_logger.info(f"✅ Successfully downloaded {song_title} using SpotDown on attempt {attempt + 1}")
+                    if self.failed_requests > 0:
+                        self.failed_requests = max(0, self.failed_requests - 1)
+                    return True
+
+                await self._handle_api_failure()
+
+            except Exception as e:
+                download_logger.warning(f"SpotDown attempt {attempt + 1} failed: {e}")
+                await self._handle_api_failure()
+
+            if attempt < MAX_API_ATTEMPTS - 1:
+                delay = RETRY_DELAY_SECONDS * (2 ** attempt) + random.uniform(1, 3)
+                download_logger.info(f"Waiting {delay:.1f}s before retry...")
+                await asyncio.sleep(delay)
+
+        download_logger.warning(f"SpotDown method failed for: {song_title}")
+        return False
+
     async def download_song(self, song_url_or_data, download_path: Path):
-        """Download song with enhanced 2-step API flow and proper session management - supports SpotDL priority"""
+        """Download song using configurable priority order"""
         # Handle both string URL and dict data
         if isinstance(song_url_or_data, dict):
             song_url = song_url_or_data.get('url', '')
@@ -2477,146 +2634,44 @@ class SpotDownAPI:
             song_url = song_url_or_data
             song_title = 'Unknown'
 
-        # Check user preference for download method
-        settings = load_settings()
-        preferred_method = settings.get('download_method', 'spotdown')
+        # Get configured priority order
+        priority_order = get_download_priority()
+        download_logger.info(f"🎯 Starting download for: {song_title}")
+        download_logger.info(f"📋 Method priority order: {[DOWNLOAD_METHODS[m]['name'] for m in priority_order if m in DOWNLOAD_METHODS]}")
 
-        # NEW PRIMARY METHOD: Tubetify + Ezconv (Spotify → YouTube → Download)
-        youtube_videos = []
-        converter_used = "None"
+        # Try each method in priority order
+        for method_id in priority_order:
+            if method_id not in DOWNLOAD_METHODS:
+                continue
 
-        # Try Tubetify first
-        if TUBETIFY_AVAILABLE and EZCONV_AVAILABLE:
-            download_logger.info(f"🔄 Trying Tubetify→Ezconv as primary method for: {song_title}")
+            method_info = DOWNLOAD_METHODS[method_id]
+            if not method_info['available']():
+                download_logger.info(f"⏭️ Skipping {method_info['name']} - not available")
+                continue
+
+            download_logger.info(f"🔄 Trying method: {method_info['name']}")
+
             try:
-                # Step 1: Convert Spotify URL to YouTube URL using Tubetify
-                youtube_videos = await spotify_to_youtube(song_url)
-                if youtube_videos:
-                    converter_used = "Tubetify"
-                    download_logger.info(f"🎯 Tubetify found {len(youtube_videos)} YouTube match(es)")
+                if method_id == 'spotify_youtube_ezconv':
+                    success = await self._try_spotify_youtube_ezconv(song_url, song_title, download_path)
+                elif method_id == 'spotdl':
+                    success = await self._try_spotdl(song_url, song_title, download_path)
+                elif method_id == 'spotdown':
+                    success = await self._try_spotdown(song_url, song_title, download_path)
                 else:
-                    download_logger.warning(f"Tubetify found no matches for: {song_title}")
-            except Exception as e:
-                download_logger.error(f"Tubetify method error: {e}")
-
-        # Try Custom converter as fallback if Tubetify failed
-        if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE and EZCONV_AVAILABLE:
-            download_logger.info(f"🔄 Trying Custom→Ezconv as fallback method for: {song_title}")
-            try:
-                # Step 1: Convert Spotify URL to YouTube URL using Custom converter
-                from custom_converter import spotify_to_youtube_custom
-                youtube_videos = await spotify_to_youtube_custom(song_url)
-                if youtube_videos:
-                    converter_used = "Custom"
-                    download_logger.info(f"🎯 Custom converter found {len(youtube_videos)} YouTube match(es)")
-                else:
-                    download_logger.warning(f"Custom converter found no matches for: {song_title}")
-            except Exception as e:
-                download_logger.error(f"Custom converter method error: {e}")
-
-        # If we have YouTube videos, try to download them
-        if youtube_videos and EZCONV_AVAILABLE:
-            download_logger.info(f"Using converter: {converter_used}")
-
-            # Use the first (best) match for automatic download
-            best_match = youtube_videos[0]
-            youtube_url = best_match['youtube_url']
-
-            download_logger.info(f"Using best match: {youtube_url}")
-
-            # Step 2: Download from YouTube using Ezconv
-            result = await download_youtube_with_ezconv(youtube_url, download_path)
-            if result and result.get('success'):
-                download_logger.info(f"✅ Successfully downloaded {song_title} using {converter_used}→Ezconv")
-                return True
-            else:
-                download_logger.warning(f"Ezconv download failed for: {song_title}")
-
-                # If first match fails and there are more options, try others
-                if len(youtube_videos) > 1:
-                    download_logger.info(f"Trying alternative matches ({len(youtube_videos)-1} remaining)")
-                    for i, video in enumerate(youtube_videos[1:], 2):
-                        try:
-                            alt_url = video['youtube_url']
-                            download_logger.info(f"Trying alternative {i}: {alt_url}")
-                            result = await download_youtube_with_ezconv(alt_url, download_path)
-                            if result and result.get('success'):
-                                download_logger.info(f"✅ Successfully downloaded using alternative {i}")
-                                return True
-                        except Exception as e:
-                            download_logger.warning(f"Alternative {i} failed: {e}")
-
-        if not youtube_videos:
-            download_logger.warning(f"No YouTube matches found using any converter for: {song_title}")
-
-        # Continue with SpotDL and other fallback methods
-        # If user prefers SpotDL and it's available, try it as fallback
-        if preferred_method == 'spotdl' and SPOTDL_AVAILABLE:
-            download_logger.info(f"🎵 Trying SpotDL as fallback method for: {song_title}")
-            try:
-                success = await try_spotdl_fallback(song_url, download_path)
-                if success:
-                    download_logger.info(f"✅ Successfully downloaded {song_title} using SpotDL (fallback)")
-                    return True
-                else:
-                    download_logger.warning(f"SpotDL fallback method failed for: {song_title}")
-            except Exception as e:
-                download_logger.error(f"SpotDL fallback method error: {e}")
-
-        for attempt in range(MAX_API_ATTEMPTS):
-            try:
-                # Rate limiting to avoid overwhelming the server
-                await self._rate_limit()
-
-                download_logger.info(f"Download attempt {attempt + 1}/{MAX_API_ATTEMPTS} for: {song_title}")
-
-                # STEP 1: Get song details (mimicking browser behavior)
-                download_logger.debug(f"Step 1: Getting song details for {song_url}")
-                song_details = await self.get_song_details(song_url)
-
-                if not song_details:
-                    download_logger.warning(f"Failed to get song details on attempt {attempt + 1}")
-                    await self._handle_api_failure()
+                    download_logger.warning(f"Unknown method: {method_id}")
                     continue
 
-                # STEP 2: Download using established session
-                download_logger.debug(f"Step 2: Proceeding with download for {song_title}")
-                success = await self._download_with_session(song_url, download_path, song_title)
-
                 if success:
-                    download_logger.info(f"✅ Successfully downloaded {song_title} on attempt {attempt + 1}")
-                    # Reset failure counter on success
-                    if self.failed_requests > 0:
-                        self.failed_requests = max(0, self.failed_requests - 1)
+                    download_logger.info(f"✅ Successfully downloaded {song_title} using {method_info['name']}")
                     return True
 
-                # Handle API failure
-                await self._handle_api_failure()
-
             except Exception as e:
-                download_logger.warning(f"Download attempt {attempt + 1} failed: {e}")
-                await self._handle_api_failure()
+                download_logger.error(f"Method {method_info['name']} failed with error: {e}")
 
-            # Wait before retrying (exponential backoff with jitter)
-            if attempt < MAX_API_ATTEMPTS - 1:
-                delay = RETRY_DELAY_SECONDS * (2 ** attempt) + random.uniform(1, 3)  # Add jitter
-                download_logger.info(f"Waiting {delay:.1f}s before retry...")
-                await asyncio.sleep(delay)
+            download_logger.info(f"❌ Method {method_info['name']} failed, trying next method...")
 
-        # Secondary fallback: Try SpotDL (different source - YouTube)
-        if SPOTDL_AVAILABLE:
-            download_logger.info(f"🎵 Trying SpotDL fallback (YouTube source) for: {song_title}")
-            try:
-                success = await try_spotdl_fallback(song_url, download_path)
-                if success:
-                    download_logger.info(f"✅ Successfully downloaded {song_title} using SpotDL fallback")
-                    return True
-                else:
-                    download_logger.warning(f"SpotDL fallback failed for: {song_title}")
-            except Exception as e:
-                download_logger.error(f"SpotDL fallback error: {e}")
-
-        download_logger.error(f"Failed to download {song_title} after {MAX_API_ATTEMPTS} attempts and all fallbacks")
+        download_logger.error(f"❌ Failed to download {song_title} after trying all configured methods")
         return False
 
 
@@ -3139,19 +3194,16 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sync_time = settings.get('sync_time', '09:00')
     notify_status = "🟢 Enabled" if settings.get('notify_sync_results', True) else "🔴 Disabled"
 
-    # Download method setting
-    download_method = settings.get('download_method', 'spotdown')  # 'spotdown' or 'spotdl'
-    if download_method == 'spotdl':
-        if SPOTDL_AVAILABLE:
-            method_status = "🎵 SpotDL (YouTube)"
-        else:
-            method_status = "❌ SpotDL (Not Available)"
-            # Fallback to spotdown if SpotDL not available
-            settings['download_method'] = 'spotdown'
-            save_settings(settings)
-            download_method = 'spotdown'
-    else:
-        method_status = "🌐 SpotDown (Default)"
+    # Download priority setting
+    priority_order = get_download_priority()
+    priority_display = []
+    for i, method_id in enumerate(priority_order, 1):
+        if method_id in DOWNLOAD_METHODS:
+            method_info = DOWNLOAD_METHODS[method_id]
+            status = "✅" if method_info['available']() else "❌"
+            priority_display.append(f"{i}. {status} {method_info['name']}")
+
+    priority_text = "\n".join(priority_display) if priority_display else "No methods configured"
 
     # Show next sync time if enabled
     next_sync_info = ""
@@ -3167,8 +3219,10 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
 *Sync Day:* {sync_day}
 *Sync Time:* {sync_time}
 *Sync Notifications:* {notify_status}
-*Download Method:* {method_status}
 *Last Sync:* {last_sync_str}{next_sync_info}
+
+*Download Priority Order:*
+{priority_text}
 
 Configure bot behavior and download preferences."""
 
@@ -3177,7 +3231,7 @@ Configure bot behavior and download preferences."""
         [InlineKeyboardButton("📅 Change Day", callback_data='change_sync_day')],
         [InlineKeyboardButton("⏰ Change Time", callback_data='change_sync_time')],
         [InlineKeyboardButton("🔔 Toggle Notifications", callback_data='toggle_notifications')],
-        [InlineKeyboardButton("🎵 Change Download Method", callback_data='toggle_download_method')],
+        [InlineKeyboardButton("🎯 Configure Download Priority", callback_data='configure_priority')],
         [InlineKeyboardButton("⬅️ Back to Menu", callback_data='main_menu')]
     ]
 
@@ -3202,31 +3256,80 @@ async def toggle_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer(f"Auto sync {status}")
     await show_settings(update, context)
 
-async def toggle_download_method(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle between SpotDown and SpotDL download methods"""
-    settings = load_settings()
-    current_method = settings.get('download_method', 'spotdown')
+async def configure_priority(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show download priority configuration menu"""
+    priority_order = get_download_priority()
+    available_methods = get_available_methods()
 
-    if current_method == 'spotdown':
-        if SPOTDL_AVAILABLE:
-            settings['download_method'] = 'spotdl'
-            new_method = 'SpotDL (YouTube source)'
-            await update.callback_query.answer(f"Switched to {new_method}")
-        else:
-            await update.callback_query.answer("❌ SpotDL not available. Install with: pip install spotdl")
-            await show_settings(update, context)
-            return
+    text = "🎯 *Configure Download Priority*\n\n"
+    text += "Current order (methods are tried in this sequence):\n\n"
+
+    for i, method_id in enumerate(priority_order, 1):
+        if method_id in DOWNLOAD_METHODS:
+            method_info = DOWNLOAD_METHODS[method_id]
+            status = "✅" if method_info['available']() else "❌"
+            text += f"{i}. {status} {method_info['name']}\n"
+
+    text += "\nUse buttons below to reorder methods:"
+
+    keyboard = []
+    # Create buttons for each method to move up/down
+    for i, method_id in enumerate(priority_order):
+        if method_id not in DOWNLOAD_METHODS:
+            continue
+
+        method_name = DOWNLOAD_METHODS[method_id]['name']
+        row = []
+
+        # Move up button (if not first)
+        if i > 0:
+            row.append(InlineKeyboardButton(f"⬆️ {method_name}", callback_data=f"priority_up_{method_id}"))
+
+        # Move down button (if not last)
+        if i < len(priority_order) - 1:
+            row.append(InlineKeyboardButton(f"⬇️ {method_name}", callback_data=f"priority_down_{method_id}"))
+
+        if row:  # Only add row if it has buttons
+            keyboard.append(row)
+
+    keyboard.append([InlineKeyboardButton("↩️ Reset to Default", callback_data='priority_reset')])
+    keyboard.append([InlineKeyboardButton("⬅️ Back to Settings", callback_data='show_settings')])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
+
+async def handle_priority_change(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, method_id: str):
+    """Handle priority order changes"""
+    priority_order = get_download_priority()
+
+    if method_id not in priority_order:
+        await update.callback_query.answer("❌ Method not found")
+        return
+
+    current_index = priority_order.index(method_id)
+
+    if action == 'up' and current_index > 0:
+        # Swap with previous method
+        priority_order[current_index], priority_order[current_index - 1] = \
+            priority_order[current_index - 1], priority_order[current_index]
+        set_download_priority(priority_order)
+        await update.callback_query.answer(f"✅ Moved {DOWNLOAD_METHODS[method_id]['name']} up")
+    elif action == 'down' and current_index < len(priority_order) - 1:
+        # Swap with next method
+        priority_order[current_index], priority_order[current_index + 1] = \
+            priority_order[current_index + 1], priority_order[current_index]
+        set_download_priority(priority_order)
+        await update.callback_query.answer(f"✅ Moved {DOWNLOAD_METHODS[method_id]['name']} down")
+    elif action == 'reset':
+        default_priority = ['spotify_youtube_ezconv', 'spotdl', 'spotdown']
+        set_download_priority(default_priority)
+        await update.callback_query.answer("✅ Priority order reset to default")
     else:
-        settings['download_method'] = 'spotdown'
-        new_method = 'SpotDown (default)'
-        await update.callback_query.answer(f"Switched to {new_method}")
+        await update.callback_query.answer("❌ Cannot move method")
+        return
 
-    save_settings(settings)
-
-    # Reset proxy statistics when changing download method
-    await proxy_manager.reset_proxy_stats()
-
-    await show_settings(update, context)
+    # Refresh the priority configuration menu
+    await configure_priority(update, context)
 
 async def toggle_notifications(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Toggle sync result notifications on/off"""
@@ -3963,8 +4066,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await toggle_sync(update, context)
     elif data == 'toggle_notifications':
         await toggle_notifications(update, context)
-    elif data == 'toggle_download_method':
-        await toggle_download_method(update, context)
+    elif data == 'configure_priority':
+        await configure_priority(update, context)
+    elif data.startswith('priority_up_'):
+        method_id = data.replace('priority_up_', '')
+        await handle_priority_change(update, context, 'up', method_id)
+    elif data.startswith('priority_down_'):
+        method_id = data.replace('priority_down_', '')
+        await handle_priority_change(update, context, 'down', method_id)
+    elif data == 'priority_reset':
+        await handle_priority_change(update, context, 'reset', '')
     elif data == 'change_sync_day':
         await change_sync_day(update, context)
     elif data == 'change_sync_time':
