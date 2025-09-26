@@ -13,13 +13,13 @@ A Telegram bot for downloading Spotify playlists to your Navidrome server with e
 
 ## ✨ **Features**
 
-### 🎯 **Enhanced Download System**
-- **Primary Method**: Spotify → YouTube conversion via tubetify.com + ezconv.com download
+### 🎯 **Simplified Download System**
+- **Primary Method**: Spotify → YouTube conversion + PullMP3.com download
 - **Manual Video Selection**: Choose from multiple YouTube matches when available
 - **Auto-Selection**: Intelligent best-match selection for seamless experience
-- **YouTube Direct Downloads**: Support for direct YouTube URL downloads
+- **YouTube Direct Downloads**: Support for direct YouTube URL downloads via PullMP3
 - **SpotDL Fallback**: Reliable fallback using spotDL for maximum success rate
-- **SpotDown API**: Original API-based downloading with proxy support
+- **SpotDown API**: Original API-based downloading as final fallback
 
 ### 🎵 **Playlist Management**
 - Download complete Spotify playlists
@@ -46,15 +46,15 @@ A Telegram bot for downloading Spotify playlists to your Navidrome server with e
 - Improved playlist and song browsing interface
 
 ### 🛡️ **Reliability Features**
-- Multi-layer download strategy with 4 fallback methods
-- Enhanced proxy rotation with caching and failure detection
+- Simplified 3-layer download strategy for maximum stability
+- PullMP3.com API integration for reliable YouTube downloads
 - Automatic retry with exponential backoff
 - Rate limiting to prevent API overload
-- SSL certificate error handling
 - Database backup and corruption recovery
 - Enhanced Spotify token acquisition with browser simulation
 - Robust callback data parsing for complex playlist IDs
 - Improved error handling and user feedback
+- No more Cloudflare captcha issues
 
 ## 📁 **File Structure**
 
@@ -75,7 +75,7 @@ The bot downloads all music to: **`/music/local/`**
 ## 🚀 **Installation**
 
 ### **Prerequisites**
-- Python 3.8+
+- Python 3.11+
 - Linux/macOS (recommended) or Windows
 - Write access to `/music/local/` directory
 
@@ -142,7 +142,6 @@ source venv/bin/activate
 
 # 3. Install dependencies
 pip install -r requirements.txt
-playwright install chromium
 
 # 4. Create directories
 sudo mkdir -p /music/local
@@ -161,10 +160,9 @@ python3 bot_spot.py
 
 **Dependencies automatically installed:**
 - `python-telegram-bot` - Telegram bot framework
-- `playwright` - Browser automation for web scraping
-- `aiohttp` - Async HTTP client for new download methods
-- `brotli` - Compression support for HTTP requests
-- `yt-dlp` - YouTube downloading capabilities
+- `aiohttp` - Async HTTP client for PullMP3 API integration
+- `requests` - HTTP requests for API calls
+- `yt-dlp` - YouTube downloading capabilities (as dependency for SpotDL)
 - `spotdl` - Fallback downloader with 95%+ success rate
 - `beautifulsoup4` - HTML parsing for video selection
 - `spotipy` - Spotify API client for Custom Converter
@@ -281,37 +279,27 @@ Configure automatic playlist updates:
 - **YouTube Integration**: Direct video processing and conversion
 - **Spotify Integration**: Direct API access with browser-simulated token acquisition
 
-### **Enhanced Download Strategy**
-The bot implements a robust 5-layer fallback download system:
+### **Simplified Download Strategy**
+The bot implements a reliable 3-layer fallback download system:
 
-1. **🥇 Primary: Tubetify → Ezconv**
-   - Converts Spotify URLs to YouTube URLs via tubetify.com
-   - Downloads high-quality MP3 from YouTube via ezconv.com API
+1. **🥇 Primary: Spotify → YouTube → PullMP3**
+   - Converts Spotify URLs to YouTube URLs via tubetify.com or custom converter
+   - Downloads high-quality MP3 from YouTube via PullMP3.com API
    - **Manual Video Selection**: Choose from multiple YouTube matches
    - **Auto-Selection**: Intelligent best-match selection
-   - **External Service**: Relies on tubetify.com availability
+   - **No Cloudflare Issues**: PullMP3 provides stable, captcha-free downloads
+   - **320kbps Quality**: High-quality audio extraction
 
-2. **🥈 Secondary: Custom Converter → Ezconv** *(NEW - Self-Hosted)*
-   - **Self-hosted Spotify→YouTube conversion** using our own implementation
-   - Uses Spotify API for precise track information (when configured)
-   - YouTube Music search via ytmusicapi for accurate results
-   - **Web scraping fallback** when API credentials not available
-   - **No external dependencies** - fully self-contained
-   - **Better accuracy** with proper Spotify API credentials
-
-3. **🥉 Tertiary: SpotDL** *(User Preference)*
-   - Only if user sets `preferred_method = 'spotdl'` in settings
+2. **🥈 Secondary: SpotDL**
    - YouTube-based download via [spotDL](https://github.com/spotDL/spotify-downloader)
-   - Activated as fallback when primary methods fail
+   - Activated as fallback when primary method fails
+   - 95%+ success rate for most tracks
+   - Direct YouTube integration
 
-4. **🔄 Quaternary: SpotDown API** *(Original Method)*
-   - Legacy spotdown.app API with enhanced proxy support
-   - Browser automation for token acquisition
-   - Multiple proxy rotation with intelligent caching
-
-5. **🆘 Final: SpotDL Fallback**
-   - Last resort SpotDL usage when all other methods fail
-   - Ensures maximum download success rate
+3. **🥉 Tertiary: SpotDown API** *(Original Method)*
+   - Legacy spotdown.app API as final fallback
+   - Original method with proven reliability
+   - Used when all other methods fail
 
 ### **New YouTube Integration Features**
 - **Direct YouTube URLs**: Support for `youtube.com` and `youtu.be` links
@@ -357,30 +345,37 @@ The bot implements a robust 5-layer fallback download system:
 - Review `logs/sync.log` for sync problems
 
 ### **Common Issues**
-- **Tubetify/Ezconv Errors**: New primary method issues - bot will retry with SpotDL
+- **PullMP3 API Errors**: Primary method issues - bot will retry with SpotDL
 - **YouTube Video Selection**: Multiple matches found - use manual selection interface
 - **HTTP 500 errors**: Server overload - bot will retry automatically
-- **SSL errors**: Proxy issues - bot will switch to direct connection
 - **Timeouts**: Network issues - bot will retry with longer timeouts
 - **Spotify Token Issues**: Automatic token refresh with browser simulation
 - **Video Not Found**: Try alternative YouTube matches or manual selection
+- **Connection Issues**: Network problems - bot has built-in retry logic
 
 ## 🆕 **Recent Updates**
 
-### **v2.0 - Enhanced YouTube Integration**
-- ✅ New primary download method: Tubetify → Ezconv
+### **v3.0 - Simplified & Optimized System**
+- ✅ **Removed problematic methods**: Eliminated ezconv (Cloudflare issues) and yt-dlp (403 errors)
+- ✅ **PullMP3 Integration**: Reliable, captcha-free YouTube downloads
+- ✅ **Simplified Architecture**: 3-layer fallback system for better stability
+- ✅ **Enhanced Reliability**: No more Cloudflare captcha or HTTP 403 issues
+- ✅ **Faster Downloads**: Streamlined process with proven methods
+- ✅ **Cleaner Codebase**: Removed complex workarounds and browser automation
+
+### **v2.0 - Enhanced YouTube Integration** *(Previous)*
 - ✅ Manual video selection from multiple YouTube matches
 - ✅ Direct YouTube URL support with playlist integration
-- ✅ Enhanced proxy system with smart rotation and caching
 - ✅ Improved error handling and user feedback
-- ✅ 4-layer fallback system for maximum reliability
+- ✅ Multiple fallback systems for maximum reliability
 
 ### **Migration Notes**
 - All existing playlists and settings are preserved
-- New Custom Converter automatically activates as Tubetify fallback
+- PullMP3 method provides better reliability than previous ezconv/yt-dlp methods
 - Existing SpotDL fallback functionality is enhanced
-- Manual video selection works with both Tubetify and Custom Converter
+- Manual video selection continues to work with improved stability
 - Spotify API configuration is optional but highly recommended
+- Simplified codebase means fewer potential failure points
 
 ### **Custom Converter Configuration**
 
@@ -436,7 +431,7 @@ This project is provided as-is for educational purposes. Users are responsible f
 
 ### **External Services:**
 - **[tubetify.com](https://tubetify.com)** - Primary Spotify→YouTube conversion service
-- **[ezconv.com](https://ezconv.com)** - YouTube audio extraction service
+- **[pullmp3.com](https://pullmp3.com)** - Reliable YouTube audio extraction service
 - **[spotdown.app](https://spotdown.app)** - Original Spotify download API
 
 ### **Special Thanks:**
@@ -446,4 +441,4 @@ This project is provided as-is for educational purposes. Users are responsible f
 
 ---
 
-**Remember**: This bot depends on third-party services and may stop working if those services change or become unavailable. The new multi-layer approach significantly improves reliability, but always have backups of your important playlists!
+**Remember**: This bot depends on third-party services and may stop working if those services change or become unavailable. The simplified 3-layer approach with PullMP3 as primary method provides excellent reliability and stability, but always have backups of your important playlists!

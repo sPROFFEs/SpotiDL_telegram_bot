@@ -1,16 +1,15 @@
 python-telegram-bot[job-queue]==21.0.1
-playwright==1.40.0
 aiohttp>=3.12.0
 requests>=2.32.3
-yt-dlp>=2024.8.6
-brotli>=1.1.0
 
 # SpotDL Fallback Dependencies
 spotdl>=4.4.0
 
-# EzconvDownloader Dependencies
+# PullMP3Downloader Dependencies
 # aiohttp (already included above)
-# brotli (already included above)
+
+# YtDlp Downloader Dependencies
+# yt-dlp (already included above)
 
 # CustomConverter Dependencies
 spotipy>=2.25.1

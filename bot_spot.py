@@ -31,12 +31,15 @@ try:
 except ImportError:
     SPOTDL_AVAILABLE = False
 
-# --- EZCONV DOWNLOADER ---
+# --- PULLMP3 DOWNLOADER (Primary YouTube Downloader) ---
 try:
-    from ezconv_downloader import download_youtube_with_ezconv, is_youtube_url as ezconv_is_youtube_url
-    EZCONV_AVAILABLE = True
+    from pullmp3_downloader import download_youtube_with_pullmp3, is_youtube_url_pullmp3
+    PULLMP3_AVAILABLE = True
 except ImportError:
-    EZCONV_AVAILABLE = False
+    PULLMP3_AVAILABLE = False
+
+# --- YT-DLP DOWNLOADER REMOVED (was causing 403 errors) ---
+YTDLP_AVAILABLE = False
 
 # --- TUBETIFY CONVERTER ---
 try:
@@ -53,7 +56,7 @@ except ImportError:
     CUSTOM_CONVERTER_AVAILABLE = False
 
 # --- CONFIGURATION ---
-TELEGRAM_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN_HERE' # Replace with your actual bot token
+TELEGRAM_TOKEN = '7689363077:AAHeEw3v2awNAL96o9XcKQdBzZD76bTxxpw' # Replace with your actual bot token
 DB_FILE = Path('playlist_db.json')
 MUSIC_DIR = Path('/music/local')
 LOGS_DIR = Path('logs')
@@ -61,10 +64,10 @@ SETTINGS_FILE = Path('bot_settings.json')
 
 # --- DOWNLOAD METHODS CONFIGURATION ---
 DOWNLOAD_METHODS = {
-    'spotify_youtube_ezconv': {
-        'name': '🎯 Spotify→YouTube→Ezconv',
-        'available': lambda: TUBETIFY_AVAILABLE and EZCONV_AVAILABLE or CUSTOM_CONVERTER_AVAILABLE and EZCONV_AVAILABLE,
-        'description': 'Convert Spotify to YouTube, then download via Ezconv'
+    'spotify_youtube_pullmp3': {
+        'name': '🎯 Spotify→YouTube→PullMP3',
+        'available': lambda: TUBETIFY_AVAILABLE and PULLMP3_AVAILABLE or CUSTOM_CONVERTER_AVAILABLE and PULLMP3_AVAILABLE,
+        'description': 'Convert Spotify to YouTube, then download via PullMP3'
     },
     'spotdl': {
         'name': '🎵 SpotDL',
@@ -112,11 +115,13 @@ if SPOTDL_AVAILABLE:
 else:
     logger.warning("⚠️ SpotDL fallback no disponible - instalar con: pip install spotdl")
 
-# Log Ezconv downloader availability
-if EZCONV_AVAILABLE:
-    logger.info("✅ Ezconv YouTube downloader disponible")
+# Log PullMP3 downloader availability
+if PULLMP3_AVAILABLE:
+    logger.info("✅ PullMP3 YouTube downloader disponible")
 else:
-    logger.warning("⚠️ Ezconv YouTube downloader no disponible - instalar aiohttp y brotli")
+    logger.warning("⚠️ PullMP3 YouTube downloader no disponible - instalar aiohttp")
+
+# yt-dlp downloader removed due to 403 errors
 
 # Log Tubetify converter availability
 if TUBETIFY_AVAILABLE:
@@ -321,7 +326,7 @@ def save_settings(settings):
 def get_download_priority():
     """Get current download methods priority order"""
     settings = load_settings()
-    default_priority = ['spotify_youtube_ezconv', 'spotdl', 'spotdown']
+    default_priority = ['spotify_youtube_pullmp3', 'spotdl', 'spotdown']
     return settings.get('download_priority', default_priority)
 
 def set_download_priority(new_priority):
@@ -2510,14 +2515,15 @@ class SpotDownAPI:
             download_logger.error(f"Session download failed: {e}")
             return False
 
-    async def _try_spotify_youtube_ezconv(self, song_url: str, song_title: str, download_path: Path) -> bool:
-        """Try Spotify→YouTube→Ezconv method"""
+
+    async def _try_spotify_youtube_pullmp3(self, song_url: str, song_title: str, download_path: Path) -> bool:
+        """Try Spotify→YouTube→PullMP3 method"""
         youtube_videos = []
         converter_used = "None"
 
         # Try Tubetify first
-        if TUBETIFY_AVAILABLE and EZCONV_AVAILABLE:
-            download_logger.info(f"🔄 Trying Tubetify→Ezconv for: {song_title}")
+        if TUBETIFY_AVAILABLE and PULLMP3_AVAILABLE:
+            download_logger.info(f"🔄 Trying Tubetify→PullMP3 for: {song_title}")
             try:
                 youtube_videos = await spotify_to_youtube(song_url)
                 if youtube_videos:
@@ -2527,8 +2533,8 @@ class SpotDownAPI:
                 download_logger.error(f"Tubetify method error: {e}")
 
         # Try Custom converter if Tubetify failed
-        if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE and EZCONV_AVAILABLE:
-            download_logger.info(f"🔄 Trying Custom→Ezconv for: {song_title}")
+        if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE and PULLMP3_AVAILABLE:
+            download_logger.info(f"🔄 Trying Custom→PullMP3 for: {song_title}")
             try:
                 from custom_converter import spotify_to_youtube_custom
                 youtube_videos = await spotify_to_youtube_custom(song_url)
@@ -2538,36 +2544,29 @@ class SpotDownAPI:
             except Exception as e:
                 download_logger.error(f"Custom converter method error: {e}")
 
-        # If we have YouTube videos, try to download them
-        if youtube_videos and EZCONV_AVAILABLE:
+        # If we have YouTube videos, try to download them (limited attempts)
+        if youtube_videos and PULLMP3_AVAILABLE:
             download_logger.info(f"Using converter: {converter_used}")
 
-            # Try the first (best) match
-            best_match = youtube_videos[0]
-            youtube_url = best_match['youtube_url']
-            download_logger.info(f"Using best match: {youtube_url}")
+            # Try up to 3 matches with PullMP3
+            max_attempts = min(3, len(youtube_videos))
+            for i, video in enumerate(youtube_videos[:max_attempts]):
+                youtube_url = video['youtube_url']
+                download_logger.info(f"Trying PullMP3 attempt {i+1}: {youtube_url}")
 
-            result = await download_youtube_with_ezconv(youtube_url, download_path)
-            if result and result.get('success'):
-                download_logger.info(f"✅ Successfully downloaded {song_title} using {converter_used}→Ezconv")
-                return True
+                try:
+                    result = await download_youtube_with_pullmp3(youtube_url, download_path, "320")
+                    if result and result.get('success'):
+                        download_logger.info(f"✅ Successfully downloaded {song_title} using {converter_used}→PullMP3")
+                        return True
+                    else:
+                        download_logger.warning(f"PullMP3 attempt {i+1} failed for {youtube_url}")
+                except Exception as e:
+                    download_logger.warning(f"PullMP3 attempt {i+1} error: {e}")
 
-            # Try alternative matches if available
-            if len(youtube_videos) > 1:
-                download_logger.info(f"Trying alternative matches ({len(youtube_videos)-1} remaining)")
-                for i, video in enumerate(youtube_videos[1:], 2):
-                    try:
-                        alt_url = video['youtube_url']
-                        download_logger.info(f"Trying alternative {i}: {alt_url}")
-                        result = await download_youtube_with_ezconv(alt_url, download_path)
-                        if result and result.get('success'):
-                            download_logger.info(f"✅ Successfully downloaded using alternative {i}")
-                            return True
-                    except Exception as e:
-                        download_logger.warning(f"Alternative {i} failed: {e}")
-
-        download_logger.warning(f"Spotify→YouTube→Ezconv method failed for: {song_title}")
+        download_logger.warning(f"Spotify→YouTube→PullMP3 method failed for: {song_title}")
         return False
+
 
     async def _try_spotdl(self, song_url: str, song_title: str, download_path: Path) -> bool:
         """Try SpotDL method"""
@@ -2652,8 +2651,8 @@ class SpotDownAPI:
             download_logger.info(f"🔄 Trying method: {method_info['name']}")
 
             try:
-                if method_id == 'spotify_youtube_ezconv':
-                    success = await self._try_spotify_youtube_ezconv(song_url, song_title, download_path)
+                if method_id == 'spotify_youtube_pullmp3':
+                    success = await self._try_spotify_youtube_pullmp3(song_url, song_title, download_path)
                 elif method_id == 'spotdl':
                     success = await self._try_spotdl(song_url, song_title, download_path)
                 elif method_id == 'spotdown':
@@ -3321,7 +3320,7 @@ async def handle_priority_change(update: Update, context: ContextTypes.DEFAULT_T
         set_download_priority(priority_order)
         await update.callback_query.answer(f"✅ Moved {DOWNLOAD_METHODS[method_id]['name']} down")
     elif action == 'reset':
-        default_priority = ['spotify_youtube_ezconv', 'spotdl', 'spotdown']
+        default_priority = ['spotify_youtube_pullmp3', 'spotdl', 'spotdown']
         set_download_priority(default_priority)
         await update.callback_query.answer("✅ Priority order reset to default")
     else:
@@ -4036,7 +4035,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['state'] = 'awaiting_spotify_search'
     elif data == 'paste_track_url':
-        youtube_status = "✅ Available (ezconv.com)" if EZCONV_AVAILABLE else "❌ Not Available"
+        youtube_downloaders = []
+        if PULLMP3_AVAILABLE:
+            youtube_downloaders.append("pullmp3.com")
+
+        if youtube_downloaders:
+            youtube_status = f"✅ Available ({', '.join(youtube_downloaders)})"
+        else:
+            youtube_status = "❌ Not Available"
         await query.edit_message_text(
             "🔗 *Paste Track URL*\n\n"
             "Send me a URL to download:\n\n"
@@ -4240,7 +4246,7 @@ async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         track_url = update.message.text
 
     # Check if it's a YouTube URL
-    if EZCONV_AVAILABLE and ezconv_is_youtube_url(track_url):
+    if PULLMP3_AVAILABLE and is_youtube_url_pullmp3(track_url):
         await handle_youtube_url(update, context, track_url)
         return
 
@@ -4265,7 +4271,7 @@ async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     converter_used = "None"
 
     # Try Tubetify first
-    if TUBETIFY_AVAILABLE and EZCONV_AVAILABLE:
+    if TUBETIFY_AVAILABLE and PULLMP3_AVAILABLE:
         await sent_message.edit_text("🔍 Searching for YouTube matches (Tubetify)...")
         try:
             from tubetify_converter import spotify_to_youtube
@@ -4277,7 +4283,7 @@ async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             logger.warning(f"Tubetify error: {e}")
 
     # Try Custom converter as fallback if Tubetify failed or unavailable
-    if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE and EZCONV_AVAILABLE:
+    if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE and PULLMP3_AVAILABLE:
         await sent_message.edit_text("🔍 Searching for YouTube matches (Custom)...")
         try:
             from custom_converter import spotify_to_youtube_custom
@@ -4615,34 +4621,41 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
     sent_message = await update.message.reply_text("🎵 Getting video information...")
 
     try:
-        if not EZCONV_AVAILABLE:
+        if not PULLMP3_AVAILABLE:
             await sent_message.edit_text("❌ YouTube downloader not available. Please install required dependencies.")
             return
 
-        # Get video information first using ezconv
-        from ezconv_downloader import EzconvDownloader
-        downloader = EzconvDownloader()
+        video_title = 'Unknown Video'
+        sanitized_title = 'unknown_video'
+        convert_result = None
+        downloader_used = None
 
-        # Get token and video info
-        token = await downloader.get_token()
-        if not token:
-            await sent_message.edit_text("❌ Failed to get authentication token for YouTube download.")
-            return
+        # Try PullMP3 first as primary downloader
+        if PULLMP3_AVAILABLE:
+            try:
+                from pullmp3_downloader import PullMP3Downloader
+                downloader = PullMP3Downloader()
 
-        convert_result = await downloader.convert_video(youtube_url, token)
+                convert_result = await downloader.convert_video(youtube_url, "320")
+                if convert_result:
+                    video_title = convert_result.get('title', 'Unknown Video')
+                    sanitized_title = downloader.sanitize_filename(video_title)
+                    downloader_used = 'pullmp3'
+            except Exception as e:
+                logger.warning(f"PullMP3 failed to get video info: {e}")
+
+
         if not convert_result:
             await sent_message.edit_text("❌ Failed to process YouTube video. Please check the URL.")
             return
-
-        video_title = convert_result.get('title', 'Unknown Video')
-        sanitized_title = downloader.sanitize_filename(video_title)
 
         # Store video info for later use
         context.user_data['youtube_track_info'] = {
             'url': youtube_url,
             'title': video_title,
             'sanitized_title': sanitized_title,
-            'convert_result': convert_result
+            'convert_result': convert_result,
+            'downloader_used': downloader_used
         }
 
         # Show options similar to Spotify tracks
@@ -4686,8 +4699,19 @@ async def youtube_download_to_new_folder(update: Update, context: ContextTypes.D
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Download using ezconv
-    result = await download_youtube_with_ezconv(youtube_info['url'], file_path)
+    # Download using PullMP3 with yt-dlp fallback
+    result = None
+    downloader_used = None
+
+    # Try PullMP3 first
+    if PULLMP3_AVAILABLE:
+        try:
+            result = await download_youtube_with_pullmp3(youtube_info['url'], file_path, "320")
+            if result and result.get('success'):
+                downloader_used = 'PullMP3'
+        except Exception as e:
+            logger.warning(f"PullMP3 download failed: {e}")
+
 
     if result and result.get('success'):
         file_size = file_path.stat().st_size if file_path.exists() else 0
@@ -4776,8 +4800,19 @@ async def youtube_add_to_playlist(update: Update, context: ContextTypes.DEFAULT_
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Download using ezconv
-    result = await download_youtube_with_ezconv(youtube_info['url'], file_path)
+    # Download using PullMP3 with yt-dlp fallback
+    result = None
+    downloader_used = None
+
+    # Try PullMP3 first
+    if PULLMP3_AVAILABLE:
+        try:
+            result = await download_youtube_with_pullmp3(youtube_info['url'], file_path, "320")
+            if result and result.get('success'):
+                downloader_used = 'PullMP3'
+        except Exception as e:
+            logger.warning(f"PullMP3 download failed: {e}")
+
 
     if result and result.get('success'):
         # Create song entry for database
@@ -4842,8 +4877,19 @@ async def handle_youtube_playlist_name(update: Update, context: ContextTypes.DEF
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Download using ezconv
-    result = await download_youtube_with_ezconv(youtube_info['url'], file_path)
+    # Download using PullMP3 with yt-dlp fallback
+    result = None
+    downloader_used = None
+
+    # Try PullMP3 first
+    if PULLMP3_AVAILABLE:
+        try:
+            result = await download_youtube_with_pullmp3(youtube_info['url'], file_path, "320")
+            if result and result.get('success'):
+                downloader_used = 'PullMP3'
+        except Exception as e:
+            logger.warning(f"PullMP3 download failed: {e}")
+
 
     if result and result.get('success'):
         # Create song entry
@@ -5192,13 +5238,23 @@ async def download_track_to_playlist(update: Update, context: ContextTypes.DEFAU
     try:
         # Check if a specific YouTube video was selected for this track
         selected_video = context.user_data.get('selected_youtube_video')
-        if selected_video and EZCONV_AVAILABLE:
+        if selected_video and PULLMP3_AVAILABLE:
             # Use the selected YouTube video for download
             youtube_url = selected_video['youtube_url']
-            from ezconv_downloader import download_youtube_with_ezconv
 
             download_logger.info(f"🎯 Using manually selected YouTube video: {youtube_url}")
-            result = await download_youtube_with_ezconv(youtube_url, file_path)
+
+            # Use PullMP3 with yt-dlp fallback for download
+            result = None
+
+            # Try PullMP3 first
+            if PULLMP3_AVAILABLE:
+                try:
+                    result = await download_youtube_with_pullmp3(youtube_url, file_path, "320")
+                except Exception as e:
+                    download_logger.warning(f"PullMP3 download failed: {e}")
+
+
             download_success = result and result.get('success', False)
 
             # Clean up the selected video from context
