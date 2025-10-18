@@ -5,14 +5,14 @@ Alternative downloader option for the bot
 """
 
 import asyncio
-import aiohttp
 import json
 import logging
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 import re
 from urllib.parse import parse_qs, urlparse
+from playwright.async_api import async_playwright, Browser, Page, Response
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -27,20 +27,140 @@ class PullMP3Downloader:
     def __init__(self):
         self.base_url = "https://pullmp3.com"
         self.api_endpoint = "/wp-admin/admin-ajax.php"
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
-            'Sec-Ch-Ua-Platform': '"Linux"',
-            'Sec-Ch-Ua': '"Not=A?Brand";v="24", "Chromium";v="140"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Accept': '*/*',
-            'Sec-Fetch-Site': 'same-origin',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Dest': 'empty',
-            'Referer': 'https://pullmp3.com/',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Priority': 'u=1, i'
-        }
+        self.last_check = 0
+        self.check_interval = 300  # 5 minutes
+        self.browser: Optional[Browser] = None
+        self.context = None
+        self.page: Optional[Page] = None
+        self._initialized = False
+        
+    async def initialize(self):
+        """Inicializa el navegador y la página"""
+        if self._initialized:
+            return
+            
+        try:
+            playwright = await async_playwright().start()
+            self.browser = await playwright.chromium.launch(
+                headless=True,
+                args=['--no-sandbox']
+            )
+            self.context = await self.browser.new_context(
+                viewport={'width': 1920, 'height': 1080},
+                user_agent='Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36'
+            )
+            self.page = await self.context.new_page()
+            self._initialized = True
+            logger.info("Browser initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize browser: {e}")
+            await self.cleanup()
+            raise
+
+    async def cleanup(self):
+        """Limpia los recursos del navegador"""
+        try:
+            if self.page:
+                await self.page.close()
+            if self.context:
+                await self.context.close()
+            if self.browser:
+                await self.browser.close()
+        except Exception as e:
+            logger.error(f"Error during cleanup: {e}")
+        finally:
+            self._initialized = False
+            self.page = None
+            self.context = None
+            self.browser = None
+            
+    async def get_session_data(self) -> Tuple[dict, str]:
+        """Obtiene las cookies y el nonce de la página"""
+        if not self._initialized:
+            await self.initialize()
+            
+        try:
+            # Configurar headers específicos para la petición inicial
+            await self.context.add_init_script('''
+                Object.defineProperty(navigator, 'languages', {
+                    get: function() { return ['en-US', 'en']; }
+                });
+            ''')
+            
+            # Navegar a la página principal con los headers correctos
+            await self.page.set_extra_http_headers({
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Cache-Control': 'max-age=0',
+                'Sec-Ch-Ua': '"Not)A;Brand";v="8", "Chromium";v="138"',
+                'Sec-Ch-Ua-Mobile': '?0',
+                'Sec-Ch-Ua-Platform': '"Linux"',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'none',
+                'Sec-Fetch-User': '?1',
+                'Upgrade-Insecure-Requests': '1'
+            })
+            
+            # Navegar a la página principal y esperar a que cargue
+            response = await self.page.goto(self.base_url, wait_until="networkidle")
+            await self.page.wait_for_load_state("domcontentloaded")
+            
+            # Extraer las cookies después de la navegación
+            cookies = await self.context.cookies()
+            cookie_dict = {cookie["name"]: cookie["value"] for cookie in cookies}
+            
+            # Buscar el nonce en el script específico
+            nonce = await self.page.evaluate('''() => {
+                const script = document.querySelector('script#pullmp3-js-js-extra');
+                if (script) {
+                    const match = script.textContent.match(/var PULLMP3 = .*"nonce":"([^"]+)"/);
+                    if (match) return match[1];
+                }
+                return null;
+            }''')
+            
+            if not nonce:
+                # Si no encontramos el nonce en el script específico, buscamos en la variable global
+                nonce = await self.page.evaluate('''() => {
+                    if (typeof PULLMP3 !== 'undefined' && PULLMP3.nonce) {
+                        return PULLMP3.nonce;
+                    }
+                    return null;
+                }''')
+            
+            if not nonce:
+                raise ValueError("Could not find nonce in page")
+            
+            logger.info(f"Found nonce: {nonce}")
+            return cookie_dict, nonce
+            
+        except Exception as e:
+            logger.error(f"Error getting session data: {e}")
+            raise
+
+    async def check_service(self) -> bool:
+        """Verifica si el servicio está activo y responde correctamente usando Playwright"""
+        if time.time() - self.last_check < self.check_interval:
+            return True
+
+        try:
+            if not self._initialized:
+                await self.initialize()
+            
+            response = await self.page.goto(self.base_url)
+            self.last_check = time.time()
+            
+            if response and response.status == 200:
+                logger.info("Service check: OK")
+                return True
+            else:
+                logger.error(f"Service check failed: Status {response.status if response else 'No response'}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Service check failed: {e}")
+            return False
 
     def extract_video_id(self, youtube_url: str) -> Optional[str]:
         """Extract YouTube video ID from URL"""
@@ -60,6 +180,13 @@ class PullMP3Downloader:
             Dict with conversion result or None if failed
         """
         try:
+            # Obtener cookies y nonce
+            try:
+                cookies, nonce = await self.get_session_data()
+            except Exception as e:
+                logger.error(f"Failed to get session data: {e}")
+                return None
+
             # Extract video ID from URL
             video_id = self.extract_video_id(youtube_url)
             if not video_id:
@@ -68,76 +195,108 @@ class PullMP3Downloader:
 
             logger.info(f"Converting video ID: {video_id} with quality: {quality}kbps")
 
-            async with aiohttp.ClientSession() as session:
-                # Build the API URL with parameters
-                api_url = f"{self.base_url}{self.api_endpoint}"
-                params = {
-                    'action': 'convert_youtube',
-                    'video_id': video_id,
-                    'quality': quality
+            api_url = f"{self.base_url}{self.api_endpoint}"
+
+            # Construir los datos del formulario
+            form_data = {
+                'action': 'convert_youtube',
+                'video_id': video_id,
+                'quality': quality,
+                '_nonce': nonce
+            }
+            
+            # Realizar la petición POST usando Playwright
+            response = await self.page.evaluate("""
+                async (params) => {
+                    const { url, data } = params;
+                    const formData = new URLSearchParams();
+                    for (const [key, value] of Object.entries(data)) {
+                        formData.append(key, value);
+                    }
+                    
+                    const response = await fetch(url, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'Accept': '*/*',
+                        },
+                        body: formData,
+                        credentials: 'include'
+                    });
+                    
+                    return await response.text();
                 }
+            """, {"url": api_url, "data": form_data})
+            
+            try:
+                data = json.loads(response)
+                logger.info(f"API Response: {response}")
 
-                async with session.get(
-                    api_url,
-                    params=params,
-                    headers=self.headers,
-                    timeout=aiohttp.ClientTimeout(total=60)
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-
-                        if data.get('status') == 'ok':
-                            logger.info(f"Conversion successful: {data.get('title', 'Unknown')}")
-                            return {
-                                'status': 'done',
-                                'title': data.get('title', 'Unknown Title'),
-                                'url': data.get('link'),
-                                'filesize': data.get('filesize', 0),
-                                'duration': data.get('duration', 0),
-                                'video_id': video_id,
-                                'quality': quality
-                            }
-                        else:
-                            logger.error(f"Conversion failed: {data}")
-                            return None
-                    else:
-                        logger.error(f"API returned status {response.status}")
-                        response_text = await response.text()
-                        logger.error(f"Response: {response_text}")
-                        return None
+                if data.get('status') == 'ok':
+                    logger.info(f"Conversion successful: {data.get('title', 'Unknown')}")
+                    return {
+                        'status': 'done',
+                        'title': data.get('title', 'Unknown Title'),
+                        'url': data.get('link', '').replace('\\/', '/'),  # Fix URL escaping
+                        'filesize': 0,  # No proporcionado por la API
+                        'duration': 0,  # No proporcionado por la API
+                        'video_id': video_id,
+                        'quality': quality,
+                        'checked_at': data.get('checked_at', 0)
+                    }
+                
+                # Si hay un mensaje de error en la respuesta, lo registramos
+                if 'data' in data and 'message' in data['data']:
+                    logger.error(f"API Error Message: {data['data']['message']}")
+                
+                logger.error(f"Conversion failed: {data}")
+                return None
+            
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse API response: {e}")
+                logger.error(f"Raw response: {response}")
+                return None
 
         except Exception as e:
             logger.error(f"Error converting video: {e}")
             return None
 
     async def download_audio(self, download_url: str, output_path: Path) -> bool:
-        """Download audio file from the provided URL"""
+        """Download audio file from the provided URL using Playwright (handles real file downloads)"""
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    download_url,
-                    timeout=aiohttp.ClientTimeout(total=300)  # 5 minutes for download
-                ) as response:
-                    if response.status == 200:
-                        output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
 
-                        with open(output_path, 'wb') as f:
-                            async for chunk in response.content.iter_chunked(8192):
-                                f.write(chunk)
+            await self.page.set_extra_http_headers({
+                'Accept': 'audio/*;q=0.9,application/ogg;q=0.7,*/*;q=0.5',
+                'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                'Referer': 'https://pullmp3.com/',
+            })
 
-                        if output_path.exists() and output_path.stat().st_size > 0:
-                            logger.info(f"Successfully downloaded: {output_path}")
-                            return True
-                        else:
-                            logger.error("Downloaded file is empty or not created")
-                            return False
-                    else:
-                        logger.error(f"Download failed with status {response.status}")
-                        return False
+            logger.info(f"Starting download from: {download_url}")
+
+            # Esperar la descarga
+            async with self.page.expect_download() as download_info:
+                # Iniciar la descarga cambiando la ubicación del navegador
+                await self.page.evaluate(f"window.location.href = '{download_url}';")
+
+            # Obtener el objeto de descarga
+            download = await download_info.value
+
+            # Guardar el archivo descargado
+            await download.save_as(str(output_path))
+
+            if output_path.exists() and output_path.stat().st_size > 0:
+                logger.info(f"✅ Successfully downloaded: {output_path} ({output_path.stat().st_size} bytes)")
+                return True
+            else:
+                logger.error("Downloaded file is empty or not created")
+                return False
 
         except Exception as e:
             logger.error(f"Error downloading audio: {e}")
             return False
+
+
 
     async def download_from_youtube(self, youtube_url: str, output_path: Path, quality: str = "320") -> Optional[Dict[str, Any]]:
         """
@@ -225,40 +384,12 @@ def is_youtube_url_pullmp3(url: str) -> bool:
     downloader = PullMP3Downloader()
     return downloader.is_youtube_url(url)
 
-# Test function
-async def test_pullmp3_downloader():
-    """Test the pullmp3 downloader"""
-    test_url = "https://youtu.be/989-7xsRLR4"  # Example YouTube URL (Vitas - The 7th Element)
-    test_output = Path("/tmp/test_pullmp3_output.mp3")
-
-    print("🧪 Testing PullMP3 Downloader...")
-
-    downloader = PullMP3Downloader()
-
-    if not downloader.is_youtube_url(test_url):
-        print("❌ Invalid YouTube URL")
-        return False
-
-    result = await downloader.download_from_youtube(test_url, test_output, "320")
-
-    if result and result.get('success'):
-        print(f"✅ Download successful!")
-        print(f"📁 Title: {result['title']}")
-        print(f"📂 File: {result['file_path']}")
-        print(f"🎵 Quality: {result['quality']}kbps")
-
-        if test_output.exists():
-            size = test_output.stat().st_size
-            print(f"📊 Size: {size / (1024*1024):.1f} MB")
-
-            # Clean up test file
-            test_output.unlink()
-
-        return True
-    else:
-        print("❌ Download failed")
-        return False
-
 if __name__ == "__main__":
     # Test the downloader
-    asyncio.run(test_pullmp3_downloader())
+    async def test():
+        test_url = "https://youtu.be/989-7xsRLR4"
+        test_output = Path("/tmp/test_pullmp3_output.mp3")
+        result = await download_youtube_with_pullmp3(test_url, test_output)
+        print("Success!" if result else "Failed!")
+
+    asyncio.run(test())
