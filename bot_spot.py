@@ -33,7 +33,7 @@ except ImportError:
 
 # --- YT-DLP DOWNLOADER ---
 try:
-    from ytdlp_downloader import download_audio as download_audio_ytdlp, get_video_info
+    from ytdlp_downloader import download_audio as download_audio_ytdlp, get_video_info, get_playlist_info, is_youtube_playlist_url
     YTDLP_AVAILABLE = True
 except ImportError:
     YTDLP_AVAILABLE = False
@@ -53,7 +53,7 @@ except ImportError:
     CUSTOM_CONVERTER_AVAILABLE = False
 
 # --- CONFIGURATION ---
-TELEGRAM_TOKEN = 'TOKEN' # Replace with your actual bot token
+TELEGRAM_TOKEN = '7689363077:AAH8JFrILckFQr3vRRD2ebTX_P_h4t0Atko' # Replace with your actual bot token
 DB_FILE = Path('playlist_db.json')
 MUSIC_DIR = Path('/music/local')
 LOGS_DIR = Path('logs')
@@ -2686,7 +2686,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('👋 Welcome! Use the menu to manage your playlists.', reply_markup=reply_markup)
 
-async def handle_playlist_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_spotify_playlist_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     playlist_url = update.message.text
     if "open.spotify.com/playlist/" not in playlist_url:
         await update.message.reply_text("Invalid Spotify playlist URL.")
@@ -2717,12 +2717,135 @@ async def handle_playlist_url(update: Update, context: ContextTypes.DEFAULT_TYPE
         parse_mode=ParseMode.MARKDOWN
     )
 
+async def handle_playlist_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    playlist_url = update.message.text
+    if is_youtube_playlist_url(playlist_url):
+        await handle_youtube_playlist_url(update, context)
+    elif "open.spotify.com/playlist/" in playlist_url:
+        await handle_spotify_playlist_url(update, context)
+    else:
+        await update.message.reply_text("Invalid playlist URL. Please send a Spotify or YouTube playlist URL.")
+
+async def handle_youtube_playlist_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    playlist_url = update.message.text
+    sent_message = await update.message.reply_text("🔍 Analyzing YouTube playlist URL...")
+
+    playlist_info = get_playlist_info(playlist_url)
+    if not playlist_info or 'entries' not in playlist_info:
+        await sent_message.edit_text("❌ Could not get YouTube playlist information.")
+        return
+
+    videos = playlist_info['entries']
+    playlist_title = playlist_info.get('title', f"YouTube Playlist with {len(videos)} videos")
+
+    context.user_data['playlist_info'] = {
+        'url': playlist_url,
+        'suggested_name': playlist_title,
+        'songs': videos,
+        'source': 'youtube'
+    }
+
+    context.user_data['state'] = 'awaiting_playlist_name'
+    await sent_message.edit_text(
+        f"✅ YouTube Playlist found: *{playlist_title}* ({len(videos)} videos).\n\n"
+        f"Please send me the name you want for the download folder. Or press the button to use the suggested name.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Use suggested name", callback_data='use_suggested_name')]]),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def confirm_youtube_playlist_download_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    info = context.user_data['playlist_info']
+    playlist_name = info['name']
+    num_songs = len(info['songs'])
+
+    keyboard = [
+        [InlineKeyboardButton(f"✅ Download now", callback_data='confirm_youtube_playlist_download')],
+        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')]
+    ]
+
+    message_text = (
+        f"A folder will be created named:\n`{playlist_name}`\n\n"
+        f"{num_songs} songs will be downloaded to it. Do you confirm?"
+    )
+
+    if update.callback_query:
+        await update.callback_query.edit_message_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
+
+    context.user_data['state'] = None
+
+async def perform_youtube_playlist_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    info = context.user_data.get('playlist_info')
+    if not info:
+        await update.callback_query.edit_message_text("Error: playlist information not found.")
+        return
+
+    videos, playlist_name, playlist_url = info['songs'], info['name'], info['url']
+    playlist_id = f"youtube_{playlist_url.split('list=')[1]}"
+
+    playlist_dir = MUSIC_DIR / playlist_name
+    playlist_dir.mkdir(exist_ok=True)
+
+    await update.callback_query.edit_message_text(f"Starting download of YouTube playlist '{playlist_name}'... ⏳")
+
+    total_videos, downloaded_count, failed_videos = len(videos), 0, []
+    successfully_downloaded_songs = []
+
+    for i, video in enumerate(videos):
+        video_title = sanitize_filename(video.get('title', 'Unknown'))
+        video_url = video.get('url', None)
+        if not video_url:
+            failed_videos.append(video_title)
+            continue
+        
+        file_path = playlist_dir / f"{video_title}"
+
+        if file_path.with_suffix('.mp3').exists():
+            downloaded_count += 1
+            successfully_downloaded_songs.append({'title': video_title, 'artist': 'YouTube', 'url': video_url, 'source': 'youtube'})
+            continue
+
+        await update.callback_query.edit_message_text(
+            f"📥 Downloading {i+1}/{total_videos}: *{video_title}*\n"
+            f"Playlist: *{playlist_name}*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+        success = download_audio_ytdlp(video_url, str(file_path))
+
+        if success:
+            downloaded_count += 1
+            successfully_downloaded_songs.append({'title': video_title, 'artist': 'YouTube', 'url': video_url, 'source': 'youtube'})
+        else:
+            failed_videos.append(video_title)
+
+    db = load_db()
+    db[playlist_id] = {
+        'name': playlist_name,
+        'url': playlist_url,
+        'songs': successfully_downloaded_songs,
+        'path': str(playlist_dir),
+        'source': 'youtube'
+    }
+    save_db(db)
+
+    final_message = f"✅ Download completed for '{playlist_name}'!\n\n▪️ Successful: {downloaded_count}/{total_videos}\n"
+    if failed_videos:
+        final_message += f"▪️ Failed: {len(failed_videos)}\n"
+
+    keyboard = [[InlineKeyboardButton("⬅️ Back to menu", callback_data='main_menu')]]
+    await update.callback_query.edit_message_text(final_message, reply_markup=InlineKeyboardMarkup(keyboard))
+    context.user_data.pop('playlist_info', None)
+
 async def handle_playlist_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     playlist_name = update.message.text
     context.user_data['playlist_info']['name'] = sanitize_filename(playlist_name)
 
-    # Confirm download
-    await confirm_download_prompt(update, context)
+    if context.user_data.get('playlist_info', {}).get('source') == 'youtube':
+        await confirm_youtube_playlist_download_prompt(update, context)
+    else:
+        await confirm_download_prompt(update, context)
 
 async def confirm_download_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = context.user_data['playlist_info']
@@ -4009,7 +4132,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info(f"Button handler received callback_data: '{data}'")
 
     if data == 'add_playlist_prompt':
-        await query.edit_message_text("Send me the Spotify playlist URL.")
+        await query.edit_message_text("Send me a Spotify or YouTube playlist URL.")
         context.user_data['state'] = 'awaiting_url'
     elif data == 'add_track_prompt':
         keyboard = [
@@ -4096,9 +4219,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'use_suggested_name':
         info = context.user_data['playlist_info']
         info['name'] = sanitize_filename(info['suggested_name'])
-        await confirm_download_prompt(update, context)
+        if info.get('source') == 'youtube':
+            await confirm_youtube_playlist_download_prompt(update, context)
+        else:
+            await confirm_download_prompt(update, context)
     elif data == 'confirm_download':
         await perform_download(update, context)
+    elif data == 'confirm_youtube_playlist_download':
+        await perform_youtube_playlist_download(update, context)
     elif data.startswith('update_'):
         playlist_id = data.split('update_')[1]
         await perform_update(update, context, playlist_id)
