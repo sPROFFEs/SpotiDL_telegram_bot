@@ -1,4 +1,3 @@
-
 import logging
 import time
 import yt_dlp
@@ -77,3 +76,40 @@ def download_audio(youtube_url, output_path, quality='192', retries=3, proxy=Non
             break  # Don't retry on unexpected errors
 
     return False
+
+def get_playlist_info(playlist_url):
+    """
+    Gets information about a YouTube playlist using yt-dlp.
+
+    Args:
+        playlist_url (str): The URL of the YouTube playlist.
+
+    Returns:
+        dict: A dictionary containing playlist information, or None if an error occurs.
+    """
+    ydl_opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'extract_flat': True,  # Extract only video entries, not full info
+        'dump_single_json': True, # Dump playlist info as a single JSON
+    }
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(playlist_url, download=False)
+            return info
+    except Exception as e:
+        logger.error(f"Error getting playlist info: {e}")
+        return None
+
+def is_youtube_playlist_url(url):
+    """
+    Checks if a URL is a YouTube playlist URL.
+
+    Args:
+        url (str): The URL to check.
+
+    Returns:
+        bool: True if the URL is a YouTube playlist URL, False otherwise.
+    """
+    return "list=" in url
