@@ -31,15 +31,12 @@ try:
 except ImportError:
     SPOTDL_AVAILABLE = False
 
-# --- PULLMP3 DOWNLOADER (Primary YouTube Downloader) ---
+# --- YT-DLP DOWNLOADER ---
 try:
-    from pullmp3_downloader import download_youtube_with_pullmp3, is_youtube_url_pullmp3
-    PULLMP3_AVAILABLE = True
+    from ytdlp_downloader import download_audio as download_audio_ytdlp, get_video_info
+    YTDLP_AVAILABLE = True
 except ImportError:
-    PULLMP3_AVAILABLE = False
-
-# --- YT-DLP DOWNLOADER REMOVED (was causing 403 errors) ---
-YTDLP_AVAILABLE = False
+    YTDLP_AVAILABLE = False
 
 # --- TUBETIFY CONVERTER ---
 try:
@@ -64,10 +61,10 @@ SETTINGS_FILE = Path('bot_settings.json')
 
 # --- DOWNLOAD METHODS CONFIGURATION ---
 DOWNLOAD_METHODS = {
-    'spotify_youtube_pullmp3': {
-        'name': '🎯 Spotify→YouTube→PullMP3',
-        'available': lambda: TUBETIFY_AVAILABLE and PULLMP3_AVAILABLE or CUSTOM_CONVERTER_AVAILABLE and PULLMP3_AVAILABLE,
-        'description': 'Convert Spotify to YouTube, then download via PullMP3'
+    'spotify_youtube_ytdlp': {
+        'name': '🎯 Spotify→YouTube→yt-dlp',
+        'available': lambda: (TUBETIFY_AVAILABLE or CUSTOM_CONVERTER_AVAILABLE) and YTDLP_AVAILABLE,
+        'description': 'Convert Spotify to YouTube, then download via yt-dlp'
     },
     'spotdl': {
         'name': '🎵 SpotDL',
@@ -115,13 +112,11 @@ if SPOTDL_AVAILABLE:
 else:
     logger.warning("⚠️ SpotDL fallback no disponible - instalar con: pip install spotdl")
 
-# Log PullMP3 downloader availability
-if PULLMP3_AVAILABLE:
-    logger.info("✅ PullMP3 YouTube downloader disponible")
+# Log YtDlp downloader availability
+if YTDLP_AVAILABLE:
+    logger.info("✅ YtDlp YouTube downloader disponible")
 else:
-    logger.warning("⚠️ PullMP3 YouTube downloader no disponible - instalar aiohttp")
-
-# yt-dlp downloader removed due to 403 errors
+    logger.warning("⚠️ YtDlp YouTube downloader no disponible - instalar yt-dlp")
 
 # Log Tubetify converter availability
 if TUBETIFY_AVAILABLE:
@@ -326,7 +321,7 @@ def save_settings(settings):
 def get_download_priority():
     """Get current download methods priority order"""
     settings = load_settings()
-    default_priority = ['spotify_youtube_pullmp3', 'spotdl', 'spotdown']
+    default_priority = ['spotify_youtube_ytdlp', 'spotdl', 'spotdown']
     return settings.get('download_priority', default_priority)
 
 def set_download_priority(new_priority):
@@ -2516,14 +2511,14 @@ class SpotDownAPI:
             return False
 
 
-    async def _try_spotify_youtube_pullmp3(self, song_url: str, song_title: str, download_path: Path) -> bool:
-        """Try Spotify→YouTube→PullMP3 method"""
+    async def _try_spotify_youtube_ytdlp(self, song_url: str, song_title: str, download_path: Path) -> bool:
+        """Try Spotify→YouTube→yt-dlp method"""
         youtube_videos = []
         converter_used = "None"
 
         # Try Tubetify first
-        if TUBETIFY_AVAILABLE and PULLMP3_AVAILABLE:
-            download_logger.info(f"🔄 Trying Tubetify→PullMP3 for: {song_title}")
+        if TUBETIFY_AVAILABLE:
+            download_logger.info(f"🔄 Trying Tubetify→yt-dlp for: {song_title}")
             try:
                 youtube_videos = await spotify_to_youtube(song_url)
                 if youtube_videos:
@@ -2533,8 +2528,8 @@ class SpotDownAPI:
                 download_logger.error(f"Tubetify method error: {e}")
 
         # Try Custom converter if Tubetify failed
-        if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE and PULLMP3_AVAILABLE:
-            download_logger.info(f"🔄 Trying Custom→PullMP3 for: {song_title}")
+        if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE:
+            download_logger.info(f"🔄 Trying Custom→yt-dlp for: {song_title}")
             try:
                 from custom_converter import spotify_to_youtube_custom
                 youtube_videos = await spotify_to_youtube_custom(song_url)
@@ -2544,27 +2539,29 @@ class SpotDownAPI:
             except Exception as e:
                 download_logger.error(f"Custom converter method error: {e}")
 
-        # If we have YouTube videos, try to download them (limited attempts)
-        if youtube_videos and PULLMP3_AVAILABLE:
+        # If we have YouTube videos, try to download them
+        if youtube_videos and YTDLP_AVAILABLE:
             download_logger.info(f"Using converter: {converter_used}")
 
-            # Try up to 3 matches with PullMP3
+            # Try up to 3 matches with yt-dlp
             max_attempts = min(3, len(youtube_videos))
             for i, video in enumerate(youtube_videos[:max_attempts]):
                 youtube_url = video['youtube_url']
-                download_logger.info(f"Trying PullMP3 attempt {i+1}: {youtube_url}")
+                download_logger.info(f"Trying yt-dlp attempt {i+1}: {youtube_url}")
 
                 try:
-                    result = await download_youtube_with_pullmp3(youtube_url, download_path, "320")
-                    if result and result.get('success'):
-                        download_logger.info(f"✅ Successfully downloaded {song_title} using {converter_used}→PullMP3")
+                    # Pass the path without the extension
+                    output_path_without_ext = download_path.with_suffix('')
+                    success = download_audio_ytdlp(youtube_url, str(output_path_without_ext))
+                    if success:
+                        download_logger.info(f"✅ Successfully downloaded {song_title} using {converter_used}→yt-dlp")
                         return True
                     else:
-                        download_logger.warning(f"PullMP3 attempt {i+1} failed for {youtube_url}")
+                        download_logger.warning(f"yt-dlp attempt {i+1} failed for {youtube_url}")
                 except Exception as e:
-                    download_logger.warning(f"PullMP3 attempt {i+1} error: {e}")
+                    download_logger.warning(f"yt-dlp attempt {i+1} error: {e}")
 
-        download_logger.warning(f"Spotify→YouTube→PullMP3 method failed for: {song_title}")
+        download_logger.warning(f"Spotify→YouTube→yt-dlp method failed for: {song_title}")
         return False
 
 
@@ -2651,8 +2648,8 @@ class SpotDownAPI:
             download_logger.info(f"🔄 Trying method: {method_info['name']}")
 
             try:
-                if method_id == 'spotify_youtube_pullmp3':
-                    success = await self._try_spotify_youtube_pullmp3(song_url, song_title, download_path)
+                if method_id == 'spotify_youtube_ytdlp':
+                    success = await self._try_spotify_youtube_ytdlp(song_url, song_title, download_path)
                 elif method_id == 'spotdl':
                     success = await self._try_spotdl(song_url, song_title, download_path)
                 elif method_id == 'spotdown':
@@ -3320,7 +3317,7 @@ async def handle_priority_change(update: Update, context: ContextTypes.DEFAULT_T
         set_download_priority(priority_order)
         await update.callback_query.answer(f"✅ Moved {DOWNLOAD_METHODS[method_id]['name']} down")
     elif action == 'reset':
-        default_priority = ['spotify_youtube_pullmp3', 'spotdl', 'spotdown']
+        default_priority = ['spotify_youtube_ytdlp', 'spotdl', 'spotdown']
         set_download_priority(default_priority)
         await update.callback_query.answer("✅ Priority order reset to default")
     else:
@@ -4035,23 +4032,25 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         context.user_data['state'] = 'awaiting_spotify_search'
     elif data == 'paste_track_url':
-        youtube_downloaders = []
-        if PULLMP3_AVAILABLE:
-            youtube_downloaders.append("pullmp3.com")
-
-        if youtube_downloaders:
-            youtube_status = f"✅ Available ({', '.join(youtube_downloaders)})"
+        if YTDLP_AVAILABLE:                                                                                                                                       
+            youtube_status = "✅ Ready to go!"                                                                                                                    
+            youtube_example = "`https://www.youtube.com/watch?v=dQw4w9WgXcQ`" 
         else:
-            youtube_status = "❌ Not Available"
+            youtube_example = "_(YouTube downloader is not configured)_"
         await query.edit_message_text(
-            "🔗 *Paste Track URL*\n\n"
-            "Send me a URL to download:\n\n"
-            "🎵 **Spotify Track:**\n"
+            "🔗 *Paste a URL to begin...*\n\n"                                                                                                                    
+            "I can download from:\n\n"                                                                                                                            
+            "🎵 **Spotify:** Just paste a track link!\n"
             "`https://open.spotify.com/track/4iV5W9uYEdYUVa79Axb7Rh`\n\n"
-            f"📺 **YouTube Video:** {youtube_status}\n"
-            "`https://www.youtube.com/watch?v=dQw4w9WgXcQ`\n\n"
-            "💡 *Features:* Auto-title detection, playlist integration, high-quality downloads",
-            parse_mode=ParseMode.MARKDOWN
+            f"📺 **YouTube:** {youtube_status}\n"                                                                                                                 
+            f"{youtube_example}\n\n"                                                                                                                              
+            "✨ **My Superpowers:**\n"                                                                                                                            
+            "-  I'll automatically grab the song title and artist.\n"                                                                                             
+            "-  You can add songs to any of your playlists.\n"                                                                                                    
+            "-  I'll download the best audio quality available.\n\n"                                                                                              
+            "Ready? Just send me a link!",                                                                                                                        
+            parse_mode=ParseMode.MARKDOWN,                                                                                                                        
+            disable_web_page_preview=True 
         )
         context.user_data['state'] = 'awaiting_track_url'
     elif data == 'search_prompt':
@@ -4246,7 +4245,7 @@ async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         track_url = update.message.text
 
     # Check if it's a YouTube URL
-    if PULLMP3_AVAILABLE and is_youtube_url_pullmp3(track_url):
+    if is_youtube_url(track_url):
         await handle_youtube_url(update, context, track_url)
         return
 
@@ -4271,7 +4270,7 @@ async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     converter_used = "None"
 
     # Try Tubetify first
-    if TUBETIFY_AVAILABLE and PULLMP3_AVAILABLE:
+    if TUBETIFY_AVAILABLE:
         await sent_message.edit_text("🔍 Searching for YouTube matches (Tubetify)...")
         try:
             from tubetify_converter import spotify_to_youtube
@@ -4283,7 +4282,7 @@ async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             logger.warning(f"Tubetify error: {e}")
 
     # Try Custom converter as fallback if Tubetify failed or unavailable
-    if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE and PULLMP3_AVAILABLE:
+    if not youtube_videos and CUSTOM_CONVERTER_AVAILABLE:
         await sent_message.edit_text("🔍 Searching for YouTube matches (Custom)...")
         try:
             from custom_converter import spotify_to_youtube_custom
@@ -4621,41 +4620,24 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
     sent_message = await update.message.reply_text("🎵 Getting video information...")
 
     try:
-        if not PULLMP3_AVAILABLE:
+        if not YTDLP_AVAILABLE:
             await sent_message.edit_text("❌ YouTube downloader not available. Please install required dependencies.")
             return
 
-        video_title = 'Unknown Video'
-        sanitized_title = 'unknown_video'
-        convert_result = None
-        downloader_used = None
+        video_info = get_video_info(youtube_url)
 
-        # Try PullMP3 first as primary downloader
-        if PULLMP3_AVAILABLE:
-            try:
-                from pullmp3_downloader import PullMP3Downloader
-                downloader = PullMP3Downloader()
-
-                convert_result = await downloader.convert_video(youtube_url, "320")
-                if convert_result:
-                    video_title = convert_result.get('title', 'Unknown Video')
-                    sanitized_title = downloader.sanitize_filename(video_title)
-                    downloader_used = 'pullmp3'
-            except Exception as e:
-                logger.warning(f"PullMP3 failed to get video info: {e}")
-
-
-        if not convert_result:
+        if not video_info:
             await sent_message.edit_text("❌ Failed to process YouTube video. Please check the URL.")
             return
+
+        video_title = video_info.get('title', 'Unknown Video')
+        sanitized_title = sanitize_filename(video_title)
 
         # Store video info for later use
         context.user_data['youtube_track_info'] = {
             'url': youtube_url,
             'title': video_title,
             'sanitized_title': sanitized_title,
-            'convert_result': convert_result,
-            'downloader_used': downloader_used
         }
 
         # Show options similar to Spotify tracks
@@ -4692,29 +4674,20 @@ async def youtube_download_to_new_folder(update: Update, context: ContextTypes.D
     # Create YouTube downloads directory
     youtube_dir = MUSIC_DIR / "YouTube Downloads"
     youtube_dir.mkdir(exist_ok=True)
-    file_path = youtube_dir / f"{sanitized_title}.mp3"
+    file_path = youtube_dir / f"{sanitized_title}"
 
     await update.callback_query.edit_message_text(
         f"📥 Downloading: *{video_title[:50]}{'...' if len(video_title) > 50 else ''}*\n\nPlease wait...",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Download using PullMP3 with yt-dlp fallback
-    result = None
-    downloader_used = None
+    success = download_audio_ytdlp(youtube_info['url'], str(file_path))
 
-    # Try PullMP3 first
-    if PULLMP3_AVAILABLE:
-        try:
-            result = await download_youtube_with_pullmp3(youtube_info['url'], file_path, "320")
-            if result and result.get('success'):
-                downloader_used = 'PullMP3'
-        except Exception as e:
-            logger.warning(f"PullMP3 download failed: {e}")
-
-
-    if result and result.get('success'):
-        file_size = file_path.stat().st_size if file_path.exists() else 0
+    if success:
+        # The actual file path will have an extension added by yt-dlp, so we need to find it.
+        # Assuming mp3 for now.
+        final_file_path = file_path.with_suffix('.mp3')
+        file_size = final_file_path.stat().st_size if final_file_path.exists() else 0
         size_mb = file_size / (1024 * 1024)
 
         final_message = (
@@ -4793,34 +4766,22 @@ async def youtube_add_to_playlist(update: Update, context: ContextTypes.DEFAULT_
 
     video_title = youtube_info['title']
     sanitized_title = youtube_info['sanitized_title']
-    file_path = playlist_dir / f"{sanitized_title}.mp3"
+    file_path = playlist_dir / f"{sanitized_title}"
 
     await update.callback_query.edit_message_text(
         f"📥 Adding to playlist: *{playlist_name}*\n\nDownloading: *{video_title[:40]}{'...' if len(video_title) > 40 else ''}*",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Download using PullMP3 with yt-dlp fallback
-    result = None
-    downloader_used = None
+    success = download_audio_ytdlp(youtube_info['url'], str(file_path))
 
-    # Try PullMP3 first
-    if PULLMP3_AVAILABLE:
-        try:
-            result = await download_youtube_with_pullmp3(youtube_info['url'], file_path, "320")
-            if result and result.get('success'):
-                downloader_used = 'PullMP3'
-        except Exception as e:
-            logger.warning(f"PullMP3 download failed: {e}")
-
-
-    if result and result.get('success'):
+    if success:
         # Create song entry for database
         song_entry = {
             'title': video_title,
             'artist': 'YouTube',  # Default artist for YouTube videos
             'url': youtube_info['url'],
-            'duration': '0:00',  # We don't get duration from ezconv
+            'duration': '0:00',
             'source': 'youtube'
         }
 
@@ -4829,7 +4790,8 @@ async def youtube_add_to_playlist(update: Update, context: ContextTypes.DEFAULT_
         db[playlist_id] = playlist_data
         save_db(db)
 
-        file_size = file_path.stat().st_size if file_path.exists() else 0
+        final_file_path = file_path.with_suffix('.mp3')
+        file_size = final_file_path.stat().st_size if final_file_path.exists() else 0
         size_mb = file_size / (1024 * 1024)
 
         final_message = (
@@ -4870,28 +4832,16 @@ async def handle_youtube_playlist_name(update: Update, context: ContextTypes.DEF
 
     video_title = youtube_info['title']
     sanitized_title = youtube_info['sanitized_title']
-    file_path = playlist_dir / f"{sanitized_title}.mp3"
+    file_path = playlist_dir / f"{sanitized_title}"
 
     sent_message = await update.message.reply_text(
         f"📝 Creating playlist: *{playlist_name}*\n\nDownloading: *{video_title[:40]}{'...' if len(video_title) > 40 else ''}*",
         parse_mode=ParseMode.MARKDOWN
     )
 
-    # Download using PullMP3 with yt-dlp fallback
-    result = None
-    downloader_used = None
+    success = download_audio_ytdlp(youtube_info['url'], str(file_path))
 
-    # Try PullMP3 first
-    if PULLMP3_AVAILABLE:
-        try:
-            result = await download_youtube_with_pullmp3(youtube_info['url'], file_path, "320")
-            if result and result.get('success'):
-                downloader_used = 'PullMP3'
-        except Exception as e:
-            logger.warning(f"PullMP3 download failed: {e}")
-
-
-    if result and result.get('success'):
+    if success:
         # Create song entry
         song_entry = {
             'title': video_title,
@@ -4915,7 +4865,8 @@ async def handle_youtube_playlist_name(update: Update, context: ContextTypes.DEF
         }
         save_db(db)
 
-        file_size = file_path.stat().st_size if file_path.exists() else 0
+        final_file_path = file_path.with_suffix('.mp3')
+        file_size = final_file_path.stat().st_size if final_file_path.exists() else 0
         size_mb = file_size / (1024 * 1024)
 
         final_message = (
@@ -5238,24 +5189,14 @@ async def download_track_to_playlist(update: Update, context: ContextTypes.DEFAU
     try:
         # Check if a specific YouTube video was selected for this track
         selected_video = context.user_data.get('selected_youtube_video')
-        if selected_video and PULLMP3_AVAILABLE:
+        if selected_video and YTDLP_AVAILABLE:
             # Use the selected YouTube video for download
             youtube_url = selected_video['youtube_url']
 
             download_logger.info(f"🎯 Using manually selected YouTube video: {youtube_url}")
 
-            # Use PullMP3 with yt-dlp fallback for download
-            result = None
-
-            # Try PullMP3 first
-            if PULLMP3_AVAILABLE:
-                try:
-                    result = await download_youtube_with_pullmp3(youtube_url, file_path, "320")
-                except Exception as e:
-                    download_logger.warning(f"PullMP3 download failed: {e}")
-
-
-            download_success = result and result.get('success', False)
+            output_path_without_ext = file_path.with_suffix('')
+            download_success = download_audio_ytdlp(youtube_url, str(output_path_without_ext))
 
             # Clean up the selected video from context
             context.user_data.pop('selected_youtube_video', None)

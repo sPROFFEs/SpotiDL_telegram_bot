@@ -1,0 +1,8 @@
+{
+    "sync_enabled": false,
+    "sync_day": "monday",
+    "sync_time": "09:00",
+    "last_sync": null,
+    "user_id": null,
+    "notify_sync_results": true
+}

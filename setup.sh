@@ -105,9 +105,25 @@ install_dependencies() {
         exit 1
     fi
 
+    # Install ffmpeg
+    print_info "Installing ffmpeg..."
+    if command_exists apt-get; then
+        sudo apt-get update > /dev/null 2>&1
+        sudo apt-get install ffmpeg -y > /dev/null 2>&1
+    elif command_exists yum; then
+        sudo yum install ffmpeg -y > /dev/null 2>&1
+    elif command_exists dnf; then
+        sudo dnf install ffmpeg -y > /dev/null 2>&1
+    elif command_exists pacman; then
+        sudo pacman -S ffmpeg --noconfirm > /dev/null 2>&1
+    else
+        print_warning "Could not install ffmpeg. Please install it manually."
+    fi
+    print_status "ffmpeg installed"
+
     # Install and setup playwright
     print_info "Setting up Playwright browser..."
-    playwright install chromium > /dev/null 2>&1
+    playwright install > /dev/null 2>&1
     print_status "Playwright browser installed"
 }
 
@@ -343,7 +359,7 @@ try:
     print('✅ Bot imports successfully')
     print(f'📦 Tubetify available: {TUBETIFY_AVAILABLE}')
     print(f'📦 Custom Converter available: {CUSTOM_CONVERTER_AVAILABLE}')
-    print(f'📦 Ezconv available: {EZCONV_AVAILABLE}')
+    print(f'📦 YtDlp available: {YTDLP_AVAILABLE}')
     print(f'📦 SpotDL available: {SPOTDL_AVAILABLE}')
 except Exception as e:
     print(f'❌ Import error: {e}')
@@ -387,11 +403,9 @@ main() {
     echo -e "   ./start_bot.sh"
     echo ""
     echo -e "${CYAN}📖 Download Strategy:${NC}"
-    echo -e "   1. 🥇 Tubetify → Ezconv (Primary)"
-    echo -e "   2. 🥈 Custom Converter → Ezconv (Self-hosted fallback)"
-    echo -e "   3. 🥉 SpotDL (User preference)"
-    echo -e "   4. 🔄 SpotDown API (Original method)"
-    echo -e "   5. 🆘 SpotDL (Final fallback)"
+    echo -e "   1. 🥇 Spotify → YouTube → yt-dlp (Primary)"
+    echo -e "   2. 🥈 spotDL (Fallback)"
+    echo -e "   3. 🥉 SpotDown API (Final fallback)"
     echo ""
 
     if [ -f ".env" ] && grep -q "SPOTIPY_CLIENT_ID=" .env && ! grep -q "^#.*SPOTIPY_CLIENT_ID=" .env; then
