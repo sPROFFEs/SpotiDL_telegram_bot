@@ -53,7 +53,7 @@ except ImportError:
     CUSTOM_CONVERTER_AVAILABLE = False
 
 # --- CONFIGURATION ---
-TELEGRAM_TOKEN = '7689363077:AAH8JFrILckFQr3vRRD2ebTX_P_h4t0Atko' # Replace with your actual bot token
+TELEGRAM_TOKEN = 'TOKEN' # Replace with your actual bot token
 DB_FILE = Path('playlist_db.json')
 MUSIC_DIR = Path('/music/local')
 LOGS_DIR = Path('logs')
