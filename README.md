@@ -14,15 +14,16 @@ A Telegram bot for downloading Spotify playlists to your Navidrome server with e
 ## ✨ **Features**
 
 ### 🎯 **Simplified Download System**
-- **Primary Method**: Spotify → YouTube conversion + PullMP3.com download
+- **Primary Method**: Spotify → YouTube conversion + yt-dlp download
 - **Manual Video Selection**: Choose from multiple YouTube matches when available
 - **Auto-Selection**: Intelligent best-match selection for seamless experience
-- **YouTube Direct Downloads**: Support for direct YouTube URL downloads via PullMP3
+- **YouTube Direct Downloads**: Support for direct YouTube URL downloads via yt-dlp
 - **SpotDL Fallback**: Reliable fallback using spotDL for maximum success rate
 - **SpotDown API**: Original API-based downloading as final fallback
 
 ### 🎵 **Playlist Management**
 - Download complete Spotify playlists
+- Download complete YouTube playlists
 - Custom folder naming for organized storage
 - Automatic playlist updates with new songs
 - Manual sync functionality
@@ -77,6 +78,7 @@ The bot downloads all music to: **`/music/local/`**
 ### **Prerequisites**
 - Python 3.11+
 - Linux/macOS (recommended) or Windows
+- `ffmpeg` (for audio processing)
 - Write access to `/music/local/` directory
 
 ### **🚀 Quick Setup (Recommended)**
@@ -160,13 +162,8 @@ python3 bot_spot.py
 
 **Dependencies automatically installed:**
 - `python-telegram-bot` - Telegram bot framework
-- `aiohttp` - Async HTTP client for PullMP3 API integration
-- `requests` - HTTP requests for API calls
-- `yt-dlp` - YouTube downloading capabilities (as dependency for SpotDL)
 - `spotdl` - Fallback downloader with 95%+ success rate
-- `beautifulsoup4` - HTML parsing for video selection
-- `spotipy` - Spotify API client for Custom Converter
-- `ytmusicapi` - YouTube Music search for Custom Converter
+- `yt-dlp` - YouTube downloading capabilities
 
 ### **🎵 Starting the Bot**
 
@@ -189,7 +186,6 @@ python3 bot_spot.py
 - `/settings` - Configure bot settings
 - `/sync` - Manual playlist synchronization
 - `/track` - Add individual tracks from Spotify URL or YouTube URL
-- `/search` - Search songs in your downloaded library
 
 ### **Main Features**
 
@@ -222,7 +218,7 @@ python3 bot_spot.py
 - **Direct URLs**: Paste YouTube video URLs for instant download
 - **Playlist Integration**: Add YouTube videos to any existing playlist
 - **Auto-Title Detection**: Automatic filename generation from video metadata
-- **Quality**: High-quality MP3 extraction (320kbps)
+- **Quality**: High-quality MP3 extraction (via yt-dlp)
 
 #### **🔍 Integrity Checking**
 - **Individual**: Click "🔍 Check Integrity" on any playlist
@@ -242,10 +238,7 @@ Configure automatic playlist updates:
 - **Smart Sync**: Only syncs Spotify playlists (excludes custom playlists)
 - **Detailed Reporting**: Shows total, syncable, and custom playlist counts
 
-#### **🔍 Library Search**
-- Use `/search <query>` to find downloaded songs
-- Search by song title, artist, or playlist name
-- Quick access to your entire music library
+
 
 ## 🔧 **Configuration**
 
@@ -282,12 +275,12 @@ Configure automatic playlist updates:
 ### **Simplified Download Strategy**
 The bot implements a reliable 3-layer fallback download system:
 
-1. **🥇 Primary: Spotify → YouTube → PullMP3**
+1. **🥇 Primary: Spotify → YouTube → yt-dlp**
    - Converts Spotify URLs to YouTube URLs via tubetify.com or custom converter
-   - Downloads high-quality MP3 from YouTube via PullMP3.com API
+   - Downloads high-quality MP3 from YouTube via yt-dlp
    - **Manual Video Selection**: Choose from multiple YouTube matches
    - **Auto-Selection**: Intelligent best-match selection
-   - **No Cloudflare Issues**: PullMP3 provides stable, captcha-free downloads
+   - **No Cloudflare Issues**: yt-dlp handles most YouTube changes
    - **320kbps Quality**: High-quality audio extraction
 
 2. **🥈 Secondary: SpotDL**
@@ -306,7 +299,7 @@ The bot implements a reliable 3-layer fallback download system:
 - **Video Selection Interface**: Choose from multiple YouTube matches for Spotify tracks
 - **Playlist Integration**: Add YouTube videos to existing playlists
 - **Auto-Title Detection**: Intelligent filename generation from video metadata
-- **Quality Optimization**: 320kbps MP3 extraction with proper metadata
+- **Quality Optimization**: 320kbps MP3 extraction with proper metadata (via yt-dlp)
 
 ### **Custom Converter Features** *(Self-Hosted Solution)*
 - **🏠 Self-Hosted**: No reliance on external conversion services
@@ -345,7 +338,7 @@ The bot implements a reliable 3-layer fallback download system:
 - Review `logs/sync.log` for sync problems
 
 ### **Common Issues**
-- **PullMP3 API Errors**: Primary method issues - bot will retry with SpotDL
+- **yt-dlp Errors**: Primary method issues - bot will retry with SpotDL
 - **YouTube Video Selection**: Multiple matches found - use manual selection interface
 - **HTTP 500 errors**: Server overload - bot will retry automatically
 - **Timeouts**: Network issues - bot will retry with longer timeouts
@@ -356,10 +349,10 @@ The bot implements a reliable 3-layer fallback download system:
 ## 🆕 **Recent Updates**
 
 ### **v3.0 - Simplified & Optimized System**
-- ✅ **Removed problematic methods**: Eliminated ezconv (Cloudflare issues) and yt-dlp (403 errors)
-- ✅ **PullMP3 Integration**: Reliable, captcha-free YouTube downloads
+- ✅ **Removed problematic methods**: Eliminated ezconv (Cloudflare issues) and PullMP3 (API instability)
+- ✅ **yt-dlp Integration**: Reliable, open-source YouTube downloads
 - ✅ **Simplified Architecture**: 3-layer fallback system for better stability
-- ✅ **Enhanced Reliability**: No more Cloudflare captcha or HTTP 403 issues
+- ✅ **Enhanced Reliability**: No more HTTP 403 issues
 - ✅ **Faster Downloads**: Streamlined process with proven methods
 - ✅ **Cleaner Codebase**: Removed complex workarounds and browser automation
 
@@ -371,7 +364,7 @@ The bot implements a reliable 3-layer fallback download system:
 
 ### **Migration Notes**
 - All existing playlists and settings are preserved
-- PullMP3 method provides better reliability than previous ezconv/yt-dlp methods
+- yt-dlp method provides better reliability than previous methods
 - Existing SpotDL fallback functionality is enhanced
 - Manual video selection continues to work with improved stability
 - Spotify API configuration is optional but highly recommended
@@ -430,8 +423,6 @@ This project is provided as-is for educational purposes. Users are responsible f
 - **[ytmusicapi](https://github.com/sigma67/ytmusicapi)** - YouTube Music API client
 
 ### **External Services:**
-- **[tubetify.com](https://tubetify.com)** - Primary Spotify→YouTube conversion service
-- **[pullmp3.com](https://pullmp3.com)** - Reliable YouTube audio extraction service
 - **[spotdown.app](https://spotdown.app)** - Original Spotify download API
 
 ### **Special Thanks:**
@@ -441,4 +432,4 @@ This project is provided as-is for educational purposes. Users are responsible f
 
 ---
 
-**Remember**: This bot depends on third-party services and may stop working if those services change or become unavailable. The simplified 3-layer approach with PullMP3 as primary method provides excellent reliability and stability, but always have backups of your important playlists!
+**Remember**: This bot depends on third-party services and may stop working if those services change or become unavailable. The simplified 3-layer approach with yt-dlp as primary method provides excellent reliability and stability, but always have backups of your important playlists!
