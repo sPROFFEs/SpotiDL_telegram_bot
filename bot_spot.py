@@ -3002,63 +3002,68 @@ async def perform_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.edit_message_text(final_message, reply_markup=InlineKeyboardMarkup(keyboard))
     context.user_data.pop('playlist_info', None)
 
-async def list_playlists(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def list_playlists(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
     db = load_db()
     if not db:
         await update.callback_query.edit_message_text("You have no saved playlists.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Add one", callback_data='add_playlist_prompt')]]))
         return
 
+    playlists = list(db.items())
+    playlists_per_page = 5
+    total_pages = (len(playlists) + playlists_per_page - 1) // playlists_per_page
+    start_idx = page * playlists_per_page
+    end_idx = min(start_idx + playlists_per_page, len(playlists))
+
     keyboard = []
-    text = "📚 *Your Playlists:*\n\n"
+    text = f"📚 *Your Playlists (Page {page + 1}/{total_pages}):*\n\n"
 
-    logger.info(f"Listing playlists from DB: {db.keys()}")
-
-    for i, (pl_id, data) in enumerate(db.items(), 1):
-        logger.info(f"Processing playlist with ID: '{pl_id}'")
-        if not pl_id or pl_id.isspace():
-            logger.warning(f"Skipping playlist with invalid ID: '{pl_id}'")
-            continue
+    for i in range(start_idx, end_idx):
+        pl_id, data = playlists[i]
+        display_index = i + 1
+        
         playlist_name = data.get('name', 'Unknown')
         song_count = len(data.get('songs', []))
         playlist_url = data.get('url', '')
         is_custom = data.get('is_custom', False)
 
-        # Add playlist header with number for clarity - add indicator for custom playlists
         source = data.get('source', 'spotify')
         source_icon = '📺' if source == 'youtube' else '🎵'
         if is_custom:
-            text += f"**{i}.** 📁 `{playlist_name}` ({song_count} songs) 🏷️ *Custom*\n"
+            text += f"**{display_index}.** 📁 `{playlist_name}` ({song_count} songs) 🏷️ *Custom*\n"
         else:
-            text += f"**{i}.** {source_icon} `{playlist_name}` ({song_count} songs)\n"
+            text += f"**{display_index}.** {source_icon} `{playlist_name}` ({song_count} songs)\n"
 
-        # Create first row with primary actions - exclude update for custom playlists
         primary_row = [
-            InlineKeyboardButton(f"{i}. 📋 Songs", callback_data=f"ls_{pl_id}")
+            InlineKeyboardButton(f"{display_index}. 📋 Songs", callback_data=f"ls_{pl_id}")
         ]
 
-        # Only add update button for syncable playlists
         if not is_custom and playlist_url:
-            primary_row.insert(0, InlineKeyboardButton(f"{i}. 🔄 Update", callback_data=f"upd_{pl_id}"))
+            primary_row.insert(0, InlineKeyboardButton(f"{display_index}. 🔄 Update", callback_data=f"upd_{pl_id}"))
 
         keyboard.append(primary_row)
 
-        # Create second row with secondary actions
         secondary_row = [
-            InlineKeyboardButton(f"{i}. 🔍 Check", callback_data=f"ci_{pl_id}"),
-            InlineKeyboardButton(f"{i}. 🗑️ Delete", callback_data=f"del_{pl_id}")
+            InlineKeyboardButton(f"{display_index}. 🔍 Check", callback_data=f"ci_{pl_id}"),
+            InlineKeyboardButton(f"{display_index}. 🗑️ Delete", callback_data=f"del_{pl_id}")
         ]
 
-        # Add link button if URL exists
         if playlist_url:
-            secondary_row.append(InlineKeyboardButton(f"{i}. 🔗 Link", url=playlist_url))
+            secondary_row.append(InlineKeyboardButton(f"{display_index}. 🔗 Link", url=playlist_url))
 
         keyboard.append(secondary_row)
 
-        # Add separator line after each playlist (except last)
-        if i < len(db):
+        if i < end_idx - 1:
             text += "─────────────────\n"
 
-    # Add global actions
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"list_playlists_{page-1}"))
+    if page < total_pages - 1:
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"list_playlists_{page+1}"))
+
+    if nav_buttons:
+        keyboard.append(nav_buttons)
+
     keyboard.append([InlineKeyboardButton("🔍 Check All Playlists", callback_data='check_all_integrity')])
     keyboard.append([InlineKeyboardButton("⬅️ Back to menu", callback_data='main_menu')])
 
@@ -3300,7 +3305,7 @@ async def perform_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, pla
 
     keyboard = [
         [InlineKeyboardButton("✅ Yes, Delete Everything", callback_data=f"cdp_{playlist_id}")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="list_playlists")]
+        [InlineKeyboardButton("❌ Cancel", callback_data="list_playlists_0")]
     ]
 
     await update.callback_query.edit_message_text(
@@ -3356,7 +3361,7 @@ async def confirm_delete_playlist(update: Update, context: ContextTypes.DEFAULT_
         message += "🗂️ Storage folder removed"
 
         keyboard = [
-            [InlineKeyboardButton("📚 View Playlists", callback_data="list_playlists")],
+            [InlineKeyboardButton("📚 View Playlists", callback_data="list_playlists_0")],
             [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
         ]
 
@@ -4374,10 +4379,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
         context.user_data['state'] = 'awaiting_search'
-    elif data == 'list_playlists_0':  # Assuming simple pagination for now
-        await list_playlists(update, context)
-    elif data == 'list_playlists':
-        await list_playlists(update, context)
+    elif data.startswith('list_playlists_'):
+        page = int(data.split('list_playlists_')[1])
+        await list_playlists(update, context, page=page)
     elif data == 'show_settings':
         await show_settings(update, context)
     elif data == 'toggle_sync':
