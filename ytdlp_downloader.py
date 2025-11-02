@@ -90,7 +90,7 @@ def get_playlist_info(playlist_url):
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
-        'extract_flat': True,  # Extract only video entries, not full info
+        'extract_flat': False,  # Extract only video entries, not full info
         'dump_single_json': True, # Dump playlist info as a single JSON
     }
 
