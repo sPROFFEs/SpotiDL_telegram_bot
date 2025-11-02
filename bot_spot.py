@@ -3490,11 +3490,11 @@ async def configure_priority(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
         # Move up button (if not first)
         if i > 0:
-            row.append(InlineKeyboardButton(f"⬆️ {method_name}", callback_data=f"priority_up_{method_id}"))
+            row.append(InlineKeyboardButton(f"⬆️ {method_name}", callback_data=f"pu_{method_id}"))
 
         # Move down button (if not last)
         if i < len(priority_order) - 1:
-            row.append(InlineKeyboardButton(f"⬇️ {method_name}", callback_data=f"priority_down_{method_id}"))
+            row.append(InlineKeyboardButton(f"⬇️ {method_name}", callback_data=f"pd_{method_id}"))
 
         if row:  # Only add row if it has buttons
             keyboard.append(row)
@@ -3554,7 +3554,7 @@ async def change_sync_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     keyboard = []
     for day in days:
-        keyboard.append([InlineKeyboardButton(day.title(), callback_data=f'set_day_{day}')])
+        keyboard.append([InlineKeyboardButton(day.title(), callback_data=f'sd_{day}')])
 
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data='show_settings')])
 
@@ -4255,7 +4255,7 @@ async def show_playlists_for_adding_songs(update: Update, context: ContextTypes.
         if len(button_text) > 60:
             button_text = button_text[:57] + "..."
 
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"add_songs_to_{playlist_id}")])
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"ast_{playlist_id}")])
         message += f"• {playlist_name} ({song_count} songs)\n"
 
     keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')])
@@ -4317,7 +4317,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['state'] = 'awaiting_url'
     elif data == 'add_track_prompt':
         keyboard = [
-            [InlineKeyboardButton("🔍 Search on Spotify", callback_data='search_spotify_tracks')],
             [InlineKeyboardButton("🔗 Paste URL", callback_data='paste_track_url')],
             [InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')]
         ]
@@ -4327,14 +4326,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode=ParseMode.MARKDOWN
         )
-    elif data == 'search_spotify_tracks':
-        await query.edit_message_text(
-            "🔍 *Search Spotify*\n\n"
-            "Send me the name of the song or artist you want to search for.\n"
-            "Example: 'bohemian rhapsody queen' or 'imagine dragons thunder'",
-            parse_mode=ParseMode.MARKDOWN
-        )
-        context.user_data['state'] = 'awaiting_spotify_search'
+
     elif data == 'paste_track_url':
         if YTDLP_AVAILABLE:                                                                                                                                       
             youtube_status = "✅ Ready to go!"                                                                                                                    
@@ -4367,8 +4359,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == 'add_to_existing_playlist_prompt':
         await show_playlists_for_adding_songs(update, context)
 
-    elif data.startswith('add_songs_to_'):
-        playlist_id = data.split('add_songs_to_')[1]
+    elif data.startswith('ast_'):
+        playlist_id = data.split('ast_')[1]
         await add_songs_to_playlist(update, context, playlist_id)
 
     elif data == 'search_prompt':
@@ -4390,11 +4382,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await toggle_notifications(update, context)
     elif data == 'configure_priority':
         await configure_priority(update, context)
-    elif data.startswith('priority_up_'):
-        method_id = data.replace('priority_up_', '')
+    elif data.startswith('pu_'):
+        method_id = data.replace('pu_', '')
         await handle_priority_change(update, context, 'up', method_id)
-    elif data.startswith('priority_down_'):
-        method_id = data.replace('priority_down_', '')
+    elif data.startswith('pd_'):
+        method_id = data.replace('pd_', '')
         await handle_priority_change(update, context, 'down', method_id)
     elif data == 'priority_reset':
         await handle_priority_change(update, context, 'reset', '')
@@ -4402,8 +4394,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await change_sync_day(update, context)
     elif data == 'change_sync_time':
         await change_sync_time(update, context)
-    elif data.startswith('set_day_'):
-        day = data.split('set_day_')[1]
+    elif data.startswith('sd_'):
+        day = data.split('sd_')[1]
         await set_sync_day(update, context, day)
     elif data == 'manual_sync':
         await manual_sync(update, context)
@@ -4494,11 +4486,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await youtube_select_playlist(update, context)
     elif data == 'youtube_create_playlist':
         await youtube_create_playlist(update, context)
-    elif data.startswith('youtube_add_to_'):
-        playlist_id = data.split('youtube_add_to_')[1]
+    elif data.startswith('yat_'):
+        playlist_id = data.split('yat_')[1]
         await youtube_add_to_playlist(update, context, playlist_id)
-    elif data.startswith('select_youtube_video_'):
-        video_index = int(data.split('select_youtube_video_')[1])
+    elif data.startswith('syv_'):
+        video_index = int(data.split('syv_')[1])
         await select_youtube_video(update, context, video_index)
     elif data == 'auto_select_youtube':
         await auto_select_youtube_video(update, context)
@@ -4550,8 +4542,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_track_playlist_name(update, context)
     elif state == 'awaiting_track_url':
         await handle_track_url(update, context)
-    elif state == 'awaiting_spotify_search':
-        await handle_spotify_search(update, context)
     elif state == 'awaiting_youtube_filename':
         await handle_youtube_filename(update, context)
     elif state == 'awaiting_youtube_playlist_name':
@@ -4630,7 +4620,7 @@ async def handle_track_url(update: Update, context: ContextTypes.DEFAULT_TYPE, t
                 video_title = video_title[:37] + "..."
             keyboard.append([InlineKeyboardButton(
                 f"🎬 {i+1}. {video_title}",
-                callback_data=f'select_youtube_video_{i}'
+                callback_data=f'syv_{i}'
             )])
 
         keyboard.append([InlineKeyboardButton("🔄 Auto-select Best Match", callback_data='auto_select_youtube')])
@@ -4744,160 +4734,6 @@ async def handle_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(message, reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
-
-async def handle_spotify_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle Spotify search query from user input"""
-    search_query = update.message.text.strip()
-
-    # Clear the state
-    context.user_data.pop('state', None)
-
-    if not search_query:
-        await update.message.reply_text("❌ Please provide a search term.")
-        return
-
-    sent_message = await update.message.reply_text("🔍 Searching Spotify...")
-
-    try:
-        # Search for tracks on Spotify
-        search_results = await api_client.search_spotify_tracks(search_query, limit=8)
-
-        if not search_results:
-            keyboard = [
-                [InlineKeyboardButton("🔍 Try Another Search", callback_data='search_spotify_tracks')],
-                [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
-            ]
-            await sent_message.edit_text(
-                f"🔍 No tracks found for: *{escape_markdown(search_query)}*\n\n"
-                "Try using different keywords or check the spelling.\n"
-                "If this persists, Spotify API tokens may need refreshing.",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode=ParseMode.MARKDOWN
-            )
-            return
-
-        # Store search results in user data
-        context.user_data['spotify_search_results'] = search_results
-
-        # Create message with results
-        message = f"🎵 *Spotify Search Results*\n"
-        message += f"Query: *{escape_markdown(search_query)}*\n\n"
-        message += "Select a track to download:\n\n"
-
-        keyboard = []
-        for i, track in enumerate(search_results):
-            # Add track info to message
-            message += f"{i+1}. **{track['artist']}** - {track['title']}\n"
-
-            # Create button for this track
-            button_text = f"🎵 {track['artist']} - {track['title']}"
-            if len(button_text) > 60:
-                button_text = button_text[:57] + "..."
-
-            keyboard.append([InlineKeyboardButton(button_text, callback_data=f"select_spotify_track_{i}")])
-
-        # Add navigation buttons
-        keyboard.append([InlineKeyboardButton("🔍 New Search", callback_data='search_spotify_tracks')])
-        keyboard.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
-
-        await sent_message.edit_text(
-            message,
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-    except Exception as e:
-        logger.error(f"Error searching Spotify: {e}")
-        keyboard = [
-            [InlineKeyboardButton("🔍 Try Again", callback_data='search_spotify_tracks')],
-            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]
-        ]
-        await sent_message.edit_text(
-            f"❌ *Search Error*\n\n"
-            f"There was an error searching Spotify. Please try again.\n\n"
-            f"Error: {str(e)}",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
-
-async def select_spotify_track(update: Update, context: ContextTypes.DEFAULT_TYPE, track_index: int):
-    """Handle selection of a track from Spotify search results"""
-    search_results = context.user_data.get('spotify_search_results', [])
-
-    if track_index >= len(search_results) or track_index < 0:
-        await update.callback_query.edit_message_text("❌ Invalid track selection.")
-        return
-
-    selected_track = search_results[track_index]
-
-    # Show loading message while getting track details
-    await update.callback_query.edit_message_text("🔍 Getting track details...")
-
-    # OPTIMIZED FLOW: Try spotdown.app API first (fast and direct)
-    track_info = None
-
-    try:
-        # Use the new spotdown.app get_song_details method
-        song_details = await api_client.get_song_details(selected_track['url'])
-        if song_details:
-            track_info = {
-                'title': selected_track['title'],  # Use search result data as it's more reliable
-                'artist': selected_track['artist'],
-                'url': selected_track['url'],
-                'download_url': selected_track['url'],  # spotdown.app will handle this
-                'source': 'spotdown_api'
-            }
-            download_logger.info(f"✅ Got track details from spotdown.app API for: {selected_track['title']}")
-    except Exception as e:
-        download_logger.warning(f"Failed to get details from spotdown.app API: {e}")
-
-    # FALLBACK 1: Spotify advanced API (if spotdown.app failed)
-    if not track_info:
-        await update.callback_query.edit_message_text("🔍 Trying Spotify API...")
-        cached_tokens = context.user_data.get('spotify_tokens', {})
-        track_info = await api_client.get_track_details_advanced(selected_track['url'], cached_tokens)
-        if track_info:
-            track_info['source'] = 'spotify_advanced'
-
-    # FALLBACK 2: Basic Playwright method (last resort)
-    if not track_info:
-        await update.callback_query.edit_message_text("🔍 Using fallback method...")
-        track_info = await api_client.get_track_details(selected_track['url'])
-        if track_info:
-            track_info['source'] = 'spotify_basic'
-
-    # FINAL FALLBACK: Use search result data
-    if not track_info:
-        track_info = {
-            'title': selected_track['title'],
-            'artist': selected_track['artist'],
-            'url': selected_track['url'],
-            'download_url': selected_track['url'],
-            'source': 'search_data'
-        }
-
-    # Store track info in user data
-    context.user_data['track_info'] = track_info
-    context.user_data['track_info']['url'] = selected_track['url']
-
-    # Show track info and ask for playlist selection
-    message = f"🎵 *Track Selected*\n\n"
-    message += f"**Title:** {track_info['title']}\n"
-    message += f"**Artist:** {track_info['artist']}\n\n"
-    message += "Where would you like to save this track?"
-
-    keyboard = [
-        [InlineKeyboardButton("📁 Select Existing Playlist", callback_data='select_playlist_for_track')],
-        [InlineKeyboardButton("➕ Create New Playlist", callback_data='create_playlist_for_track')],
-        [InlineKeyboardButton("🔍 Back to Search", callback_data='search_spotify_tracks')],
-        [InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')]
-    ]
-
-    await update.callback_query.edit_message_text(
-        message,
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode=ParseMode.MARKDOWN
-    )
 
 async def show_playlists_for_track(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show existing playlists to select for adding a track"""
@@ -5047,7 +4883,7 @@ async def youtube_select_playlist(update: Update, context: ContextTypes.DEFAULT_
         song_count = len(playlist_data.get('songs', []))
         keyboard.append([InlineKeyboardButton(
             f"📁 {playlist_name} ({song_count} songs)",
-            callback_data=f'youtube_add_to_{playlist_id}'
+            callback_data=f'yat_{playlist_id}'
         )])
 
     keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data='youtube_back_to_options')])
