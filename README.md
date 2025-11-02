@@ -24,10 +24,11 @@ A Telegram bot for downloading Spotify playlists to your Navidrome server with e
 ### 🎵 **Playlist Management**
 - Download complete Spotify playlists
 - Download complete YouTube playlists
+- Add songs from a new playlist to an existing one
 - Custom folder naming for organized storage
 - Automatic playlist updates with new songs
 - Manual sync functionality
-- Individual track addition from Spotify search or URL
+- Individual track addition from Spotify or YouTube URL
 - Custom playlist creation for single tracks
 - Smart sync exclusion for custom playlists
 - YouTube video integration with playlist management
@@ -39,6 +40,7 @@ A Telegram bot for downloading Spotify playlists to your Navidrome server with e
 - Duration-based validation using ffmpeg (optional)
 
 ### 📋 **Song Management**
+- Paginated playlist view to handle large number of playlists
 - List all songs in any playlist
 - Delete individual songs with confirmation
 - File existence verification
@@ -191,21 +193,20 @@ python3 bot_spot.py
 
 #### **➕ Add Playlist**
 1. Click "➕ Add Playlist"
-2. Send Spotify playlist URL
-3. Choose folder name
-4. Confirm download
+2. Send Spotify or YouTube playlist URL
+3. Choose to "Create new playlist" or "Add to existing playlist"
+4. If creating new, choose folder name and confirm download
+5. If adding to existing, select the playlist to add the songs to
 
 #### **🎵 Add Individual Tracks**
 1. Click "➕ Add Track" or use `/track <spotify_or_youtube_url>`
-2. **Search Method**: Search Spotify directly with song/artist name
-3. **URL Method**: Paste a Spotify track URL or YouTube video URL
-4. **Video Selection**: When multiple YouTube matches are found:
+2. Paste a Spotify track URL or YouTube video URL
+3. **Video Selection**: When multiple YouTube matches are found for a Spotify track:
    - Choose manually from up to 5 video options
    - Use "Auto-select Best Match" for convenience
    - Preview video titles before selection
-5. Select from search results or confirm URL track
-6. Choose existing playlist or create a new one
-7. Track is downloaded to the selected playlist
+4. Choose existing playlist or create a new one
+5. Track is downloaded to the selected playlist
 
 #### **🎯 **Enhanced Video Selection**
 - **Multiple Matches**: When Spotify tracks have multiple YouTube versions
