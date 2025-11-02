@@ -2710,6 +2710,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text('👋 Welcome! Use the menu to manage your playlists.', reply_markup=reply_markup)
 
+async def ask_playlist_destination(sent_message, context: ContextTypes.DEFAULT_TYPE, playlist_info: dict):
+    playlist_title = playlist_info.get('suggested_name', 'Unknown')
+    song_count = len(playlist_info.get('songs', []))
+
+    context.user_data['playlist_info'] = playlist_info
+
+    keyboard = [
+        [InlineKeyboardButton("➕ Create new playlist", callback_data='create_new_playlist_prompt')],
+        [InlineKeyboardButton("📂 Add to existing playlist", callback_data='add_to_existing_playlist_prompt')]
+    ]
+    await sent_message.edit_text(
+        f"✅ Playlist found: *{playlist_title}* ({song_count} songs).\n\n"
+        f"What would you like to do?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
 async def handle_spotify_playlist_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     playlist_url = update.message.text
     if "open.spotify.com/playlist/" not in playlist_url:
@@ -2726,20 +2743,13 @@ async def handle_spotify_playlist_url(update: Update, context: ContextTypes.DEFA
     songs = response_data["songs"]
     playlist_title = response_data.get("title", f"Playlist with {len(songs)} songs")
 
-    context.user_data['playlist_info'] = {
+    playlist_info = {
         'url': playlist_url,
         'suggested_name': playlist_title,
-        'songs': songs
+        'songs': songs,
+        'source': 'spotify'
     }
-
-    # New step: ask user for folder name
-    context.user_data['state'] = 'awaiting_playlist_name'
-    await sent_message.edit_text(
-        f"✅ Playlist found: *{playlist_title}* ({len(songs)} songs).\n\n"
-        f"Please send me the name you want for the download folder. Or press the button to use the suggested name.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Use suggested name", callback_data='use_suggested_name')]]),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await ask_playlist_destination(sent_message, context, playlist_info)
 
 async def handle_playlist_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     playlist_url = update.message.text
@@ -2754,28 +2764,21 @@ async def handle_youtube_playlist_url(update: Update, context: ContextTypes.DEFA
     playlist_url = update.message.text
     sent_message = await update.message.reply_text("🔍 Analyzing YouTube playlist URL...")
 
-    playlist_info = get_playlist_info(playlist_url)
-    if not playlist_info or 'entries' not in playlist_info:
+    playlist_info_yt = get_playlist_info(playlist_url)
+    if not playlist_info_yt or 'entries' not in playlist_info_yt:
         await sent_message.edit_text("❌ Could not get YouTube playlist information.")
         return
 
-    videos = playlist_info['entries']
-    playlist_title = playlist_info.get('title', f"YouTube Playlist with {len(videos)} videos")
+    videos = playlist_info_yt['entries']
+    playlist_title = playlist_info_yt.get('title', f"YouTube Playlist with {len(videos)} videos")
 
-    context.user_data['playlist_info'] = {
+    playlist_info = {
         'url': playlist_url,
         'suggested_name': playlist_title,
         'songs': videos,
         'source': 'youtube'
     }
-
-    context.user_data['state'] = 'awaiting_playlist_name'
-    await sent_message.edit_text(
-        f"✅ YouTube Playlist found: *{playlist_title}* ({len(videos)} videos).\n\n"
-        f"Please send me the name you want for the download folder. Or press the button to use the suggested name.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Use suggested name", callback_data='use_suggested_name')]]),
-        parse_mode=ParseMode.MARKDOWN
-    )
+    await ask_playlist_destination(sent_message, context, playlist_info)
 
 async def confirm_youtube_playlist_download_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     info = context.user_data['playlist_info']
@@ -2837,9 +2840,14 @@ async def perform_youtube_playlist_download(update: Update, context: ContextType
         
         file_path = playlist_dir / f"{video_title}"
 
+        duration_seconds = video.get('duration', 0)
+        minutes = duration_seconds // 60
+        seconds = duration_seconds % 60
+        duration_str = f"{minutes}:{seconds:02d}"
+
         if file_path.with_suffix('.mp3').exists():
             downloaded_count += 1
-            successfully_downloaded_songs.append({'title': video_title, 'artist': 'YouTube', 'url': video_url, 'source': 'youtube'})
+            successfully_downloaded_songs.append({'title': video_title, 'artist': 'YouTube', 'url': video_url, 'source': 'youtube', 'duration': duration_str})
             continue
 
         await update.callback_query.edit_message_text(
@@ -2852,7 +2860,11 @@ async def perform_youtube_playlist_download(update: Update, context: ContextType
 
         if success:
             downloaded_count += 1
-            successfully_downloaded_songs.append({'title': video_title, 'artist': 'YouTube', 'url': video_url, 'source': 'youtube'})
+            duration_seconds = video.get('duration', 0)
+            minutes = duration_seconds // 60
+            seconds = duration_seconds % 60
+            duration_str = f"{minutes}:{seconds:02d}"
+            successfully_downloaded_songs.append({'title': video_title, 'artist': 'YouTube', 'url': video_url, 'source': 'youtube', 'duration': duration_str})
         else:
             failed_videos.append(video_title)
 
@@ -2999,7 +3011,10 @@ async def list_playlists(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     text = "📚 *Your Playlists:*\n\n"
 
+    logger.info(f"Listing playlists from DB: {db.keys()}")
+
     for i, (pl_id, data) in enumerate(db.items(), 1):
+        logger.info(f"Processing playlist with ID: '{pl_id}'")
         if not pl_id or pl_id.isspace():
             logger.warning(f"Skipping playlist with invalid ID: '{pl_id}'")
             continue
@@ -3018,19 +3033,19 @@ async def list_playlists(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Create first row with primary actions - exclude update for custom playlists
         primary_row = [
-            InlineKeyboardButton(f"{i}. 📋 Songs", callback_data=f"list_songs_{pl_id}")
+            InlineKeyboardButton(f"{i}. 📋 Songs", callback_data=f"ls_{pl_id}")
         ]
 
         # Only add update button for syncable playlists
         if not is_custom and playlist_url:
-            primary_row.insert(0, InlineKeyboardButton(f"{i}. 🔄 Update", callback_data=f"update_{pl_id}"))
+            primary_row.insert(0, InlineKeyboardButton(f"{i}. 🔄 Update", callback_data=f"upd_{pl_id}"))
 
         keyboard.append(primary_row)
 
         # Create second row with secondary actions
         secondary_row = [
-            InlineKeyboardButton(f"{i}. 🔍 Check", callback_data=f"check_integrity_{pl_id}"),
-            InlineKeyboardButton(f"{i}. 🗑️ Delete", callback_data=f"delete_{pl_id}")
+            InlineKeyboardButton(f"{i}. 🔍 Check", callback_data=f"ci_{pl_id}"),
+            InlineKeyboardButton(f"{i}. 🗑️ Delete", callback_data=f"del_{pl_id}")
         ]
 
         # Add link button if URL exists
@@ -3123,7 +3138,7 @@ async def perform_update(update: Update, context: ContextTypes.DEFAULT_TYPE, pla
 
             # Ask if user wants to download new songs
             keyboard = [
-                [InlineKeyboardButton("📥 Download New Songs", callback_data=f'download_new_{playlist_id}')],
+                [InlineKeyboardButton("📥 Download New Songs", callback_data=f'dn_{playlist_id}')],
                 [InlineKeyboardButton("⬅️ Back to Playlists", callback_data='list_playlists_0')]
             ]
 
@@ -3284,7 +3299,7 @@ async def perform_delete(update: Update, context: ContextTypes.DEFAULT_TYPE, pla
     message += "This action cannot be undone. Are you sure?"
 
     keyboard = [
-        [InlineKeyboardButton("✅ Yes, Delete Everything", callback_data=f"confirm_delete_playlist_{playlist_id}")],
+        [InlineKeyboardButton("✅ Yes, Delete Everything", callback_data=f"cdp_{playlist_id}")],
         [InlineKeyboardButton("❌ Cancel", callback_data="list_playlists")]
     ]
 
@@ -3633,7 +3648,7 @@ async def manual_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     keyboard.append([
                         InlineKeyboardButton(
                             f"🔄 Sync {name} ({count} songs)",
-                            callback_data=f"resync_playlist_{playlist['id']}"
+                            callback_data=f"rs_{playlist['id']}"
                         )
                     ])
 
@@ -3792,7 +3807,7 @@ async def perform_integrity_check(update: Update, context: ContextTypes.DEFAULT_
 
         if result['corrupted_songs'] or result['missing_songs']:
             # Show fix option if there are issues
-            keyboard.append([InlineKeyboardButton("🔧 Fix Issues", callback_data=f"fix_integrity_{playlist_id}")])
+            keyboard.append([InlineKeyboardButton("🔧 Fix Issues", callback_data=f"fi_{playlist_id}")])
 
             # Show details of corrupted/missing songs
             if result['corrupted_songs']:
@@ -3962,6 +3977,8 @@ async def list_playlist_songs(update: Update, context: ContextTypes.DEFAULT_TYPE
     playlist_name = playlist_data.get('name', 'Unknown')
     songs = playlist_data.get('songs', [])
 
+    source = playlist_data.get('source', 'spotify')
+
     if not songs:
         await update.callback_query.edit_message_text(
             f"📋 *{escape_markdown(playlist_name)}*\n\nNo songs found.",
@@ -3989,7 +4006,10 @@ async def list_playlist_songs(update: Update, context: ContextTypes.DEFAULT_TYPE
 
         # Check if file exists
         playlist_dir = MUSIC_DIR / playlist_name
-        file_path = playlist_dir / f"{sanitize_filename(artist_name)} - {sanitize_filename(song_title)}.mp3"
+        if source == 'youtube':
+            file_path = playlist_dir / f"{sanitize_filename(song_title)}.mp3"
+        else:
+            file_path = playlist_dir / f"{sanitize_filename(artist_name)} - {sanitize_filename(song_title)}.mp3"
         status_icon = "✅" if file_path.exists() else "❌"
 
         message += f"{i+1}. {status_icon} *{escape_markdown(artist_name)}* - {escape_markdown(song_title)} ({escape_markdown(str(duration))})\n"
@@ -4000,9 +4020,9 @@ async def list_playlist_songs(update: Update, context: ContextTypes.DEFAULT_TYPE
     # Pagination buttons
     nav_buttons = []
     if page > 0:
-        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"songs_page_{playlist_id}_{page-1}"))
+        nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"sp_{playlist_id}_{page-1}"))
     if page < total_pages - 1:
-        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"songs_page_{playlist_id}_{page+1}"))
+        nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"sp_{playlist_id}_{page+1}"))
 
     if nav_buttons:
         keyboard.append(nav_buttons)
@@ -4067,7 +4087,7 @@ async def delete_song(update: Update, context: ContextTypes.DEFAULT_TYPE, playli
     message += "This will delete both the file and remove it from the database. Are you sure?"
 
     keyboard = [
-        [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"confirm_delete_song_{playlist_id}_{song_index}")],
+        [InlineKeyboardButton("✅ Yes, Delete", callback_data=f"cds_{playlist_id}_{song_index}")],
         [InlineKeyboardButton("❌ Cancel", callback_data=f"list_songs_{playlist_id}")]
     ]
 
@@ -4100,6 +4120,8 @@ async def confirm_delete_song(update: Update, context: ContextTypes.DEFAULT_TYPE
     song_title = sanitize_filename(song.get('title', 'Unknown'))
     artist_name = sanitize_filename(song.get('artist', 'Unknown'))
 
+    source = playlist_data.get('source', 'spotify')
+
     try:
         # Delete file from filesystem - use stored path
         playlist_path = playlist_data.get('path')
@@ -4109,7 +4131,10 @@ async def confirm_delete_song(update: Update, context: ContextTypes.DEFAULT_TYPE
             # Fallback to old method if no path stored
             playlist_dir = MUSIC_DIR / playlist_name
 
-        file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
+        if source == 'youtube':
+            file_path = playlist_dir / f"{song_title}.mp3"
+        else:
+            file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
         file_deleted = False
 
         logger.info(f"Attempting to delete file: {file_path}")
@@ -4205,6 +4230,75 @@ async def show_song_details(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         parse_mode=ParseMode.MARKDOWN
     )
 
+async def show_playlists_for_adding_songs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    db = load_db()
+    if not db:
+        await update.callback_query.edit_message_text(
+            "❌ No playlists found. Create a new playlist first.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ Create New Playlist", callback_data='create_new_playlist_prompt')]])
+        )
+        return
+
+    keyboard = []
+    message = "📁 *Select Playlist*\n\nChoose a playlist to add the songs to:\n\n"
+
+    for playlist_id, playlist_data in db.items():
+        playlist_name = playlist_data.get('name', 'Unknown')
+        song_count = len(playlist_data.get('songs', []))
+
+        button_text = f"📁 {playlist_name} ({song_count} songs)"
+        if len(button_text) > 60:
+            button_text = button_text[:57] + "..."
+
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"add_songs_to_{playlist_id}")])
+        message += f"• {playlist_name} ({song_count} songs)\n"
+
+    keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data='cancel_action')])
+
+    await update.callback_query.edit_message_text(
+        message,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def add_songs_to_playlist(update: Update, context: ContextTypes.DEFAULT_TYPE, playlist_id: str):
+    db = load_db()
+    if playlist_id not in db:
+        await update.callback_query.edit_message_text("❌ Playlist not found.")
+        return
+
+    playlist_data = db[playlist_id]
+    playlist_name = playlist_data.get('name', 'Unknown')
+
+    # Get new songs info
+    new_songs_info = context.user_data.get('playlist_info')
+    if not new_songs_info:
+        await update.callback_query.edit_message_text("❌ Playlist information lost. Please try again.")
+        return
+
+    new_songs = new_songs_info['songs']
+    
+    # Find songs that are actually new
+    existing_songs = playlist_data.get('songs', [])
+    existing_urls = {song.get('url') for song in existing_songs}
+    songs_to_add = [song for song in new_songs if song.get('url') not in existing_urls]
+
+    if not songs_to_add:
+        await update.callback_query.edit_message_text(
+            f"✅ All songs from the new playlist already exist in '{playlist_name}'.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+        )
+        return
+
+    # Add new songs to playlist data
+    playlist_data['songs'].extend(songs_to_add)
+    db[playlist_id] = playlist_data
+    save_db(db)
+
+    # Download the new songs
+    context.user_data[f'new_songs_{playlist_id}'] = songs_to_add
+    await download_new_songs(update, context, playlist_id)
+
 # --- STATE AND BUTTON HANDLERS ---
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4258,6 +4352,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True 
         )
         context.user_data['state'] = 'awaiting_track_url'
+    elif data == 'create_new_playlist_prompt':
+        info = context.user_data['playlist_info']
+        await query.edit_message_text(
+            f"Please send me the name you want for the download folder. Or press the button to use the suggested name.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Use suggested name", callback_data='use_suggested_name')]]))
+        context.user_data['state'] = 'awaiting_playlist_name'
+
+    elif data == 'add_to_existing_playlist_prompt':
+        await show_playlists_for_adding_songs(update, context)
+
+    elif data.startswith('add_songs_to_'):
+        playlist_id = data.split('add_songs_to_')[1]
+        await add_songs_to_playlist(update, context, playlist_id)
+
     elif data == 'search_prompt':
         await query.edit_message_text(
             "🔍 *Search Songs*\n\n"
@@ -4295,8 +4403,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await set_sync_day(update, context, day)
     elif data == 'manual_sync':
         await manual_sync(update, context)
-    elif data.startswith('resync_playlist_'):
-        playlist_id = data.split('resync_playlist_')[1]
+    elif data.startswith('rs_'):
+        playlist_id = data.split('rs_')[1]
         await resync_individual_playlist(update, context, playlist_id)
     elif data == 'use_suggested_name':
         info = context.user_data['playlist_info']
@@ -4309,11 +4417,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await perform_download(update, context)
     elif data == 'confirm_youtube_playlist_download':
         await perform_youtube_playlist_download(update, context)
-    elif data.startswith('update_'):
-        playlist_id = data.split('update_')[1]
+    elif data.startswith('upd_'):
+        playlist_id = data.split('upd_')[1]
         await perform_update(update, context, playlist_id)
-    elif data.startswith('download_new_'):
-        playlist_id = data.split('download_new_')[1]
+    elif data.startswith('dn_'):
+        playlist_id = data.split('dn_')[1]
         await download_new_songs(update, context, playlist_id)
     elif data.startswith('delete_song_'):
         # Format: delete_song_{playlist_id}_{song_index}
@@ -4322,40 +4430,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         playlist_id = parts[0]
         song_index = int(parts[1])
         await delete_song(update, context, playlist_id, song_index)
-    elif data.startswith('delete_'):
-        playlist_id = data.split('delete_')[1]
+    elif data.startswith('del_'):
+        playlist_id = data.split('del_')[1]
         await perform_delete(update, context, playlist_id)
-    elif data.startswith('check_integrity_'):
-        playlist_id = data.split('check_integrity_')[1]
+    elif data.startswith('ci_'):
+        playlist_id = data.split('ci_')[1]
         await perform_integrity_check(update, context, playlist_id)
-    elif data.startswith('fix_integrity_'):
-        playlist_id = data.split('fix_integrity_')[1]
+    elif data.startswith('fi_'):
+        playlist_id = data.split('fi_')[1]
         await fix_integrity_issues(update, context, playlist_id)
     elif data == 'check_all_integrity':
         await check_all_playlists_integrity(update, context)
-    elif data.startswith('list_songs_'):
-        playlist_id = data.split('list_songs_')[1]
+    elif data.startswith('ls_'):
+        playlist_id = data.split('ls_')[1]
         await list_playlist_songs(update, context, playlist_id)
-    elif data.startswith('songs_page_'):
-        # Format: songs_page_{playlist_id}_{page}
-        remaining = data.replace('songs_page_', '', 1)
+    elif data.startswith('sp_'):
+        # Format: sp_{playlist_id}_{page}
+        remaining = data.replace('sp_', '', 1)
         parts = remaining.rsplit('_', 1)
         playlist_id = parts[0]
         page = int(parts[1])
         await list_playlist_songs(update, context, playlist_id, page)
-    elif data.startswith('confirm_delete_playlist_'):
-        playlist_id = data.split('confirm_delete_playlist_')[1]
+    elif data.startswith('cdp_'):
+        playlist_id = data.split('cdp_')[1]
         await confirm_delete_playlist(update, context, playlist_id)
-    elif data.startswith('confirm_delete_song_'):
-        # Format: confirm_delete_song_{playlist_id}_{song_index}
-        remaining = data.replace('confirm_delete_song_', '', 1)
+    elif data.startswith('cds_'):
+        # Format: cds_{playlist_id}_{song_index}
+        remaining = data.replace('cds_', '', 1)
         parts = remaining.rsplit('_', 1)
         playlist_id = parts[0]
         song_index = int(parts[1])
         await confirm_delete_song(update, context, playlist_id, song_index)
-    elif data.startswith('show_song_'):
-        # Format: show_song_{playlist_id}_{song_index}
-        remaining = data.replace('show_song_', '', 1)
+    elif data.startswith('ss_'):
+        # Format: ss_{playlist_id}_{song_index}
+        remaining = data.replace('ss_', '', 1)
         parts = remaining.rsplit('_', 1)
         playlist_id = parts[0]
         song_index = int(parts[1])
@@ -4368,8 +4476,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode=ParseMode.MARKDOWN
         )
         context.user_data['state'] = 'awaiting_track_playlist_name'
-    elif data.startswith('add_track_to_'):
-        playlist_id = data.split('add_track_to_')[1]
+    elif data.startswith('att_'):
+        playlist_id = data.split('att_')[1]
         await add_track_to_playlist(update, context, playlist_id)
     elif data.startswith('select_spotify_track_'):
         track_index = int(data.split('select_spotify_track_')[1])
@@ -4617,7 +4725,7 @@ async def handle_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE
         if len(button_text) > 60:  # Truncate long titles
             button_text = button_text[:57] + "..."
 
-        callback_data = f"show_song_{result['playlist_id']}_{result['song_index']}"
+        callback_data = f"ss_{result['playlist_id']}_{result['song_index']}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
 
         # Add playlist info to message
@@ -4809,7 +4917,7 @@ async def show_playlists_for_track(update: Update, context: ContextTypes.DEFAULT
         if len(button_text) > 60:
             button_text = button_text[:57] + "..."
 
-        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"add_track_to_{playlist_id}")])
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"att_{playlist_id}")])
         message += f"• {playlist_name} ({song_count} songs)\n"
 
     keyboard.append([InlineKeyboardButton("➕ Create New Playlist", callback_data='create_playlist_for_track')])
@@ -4844,6 +4952,7 @@ async def handle_youtube_url(update: Update, context: ContextTypes.DEFAULT_TYPE,
             'url': youtube_url,
             'title': video_title,
             'sanitized_title': sanitized_title,
+            'duration': video_info.get('duration', 0)
         }
 
         # Show options similar to Spotify tracks
@@ -4983,11 +5092,15 @@ async def youtube_add_to_playlist(update: Update, context: ContextTypes.DEFAULT_
 
     if success:
         # Create song entry for database
+        duration_seconds = youtube_info.get('duration', 0)
+        minutes = duration_seconds // 60
+        seconds = duration_seconds % 60
+        duration_str = f"{minutes}:{seconds:02d}"
         song_entry = {
             'title': video_title,
             'artist': 'YouTube',  # Default artist for YouTube videos
             'url': youtube_info['url'],
-            'duration': '0:00',
+            'duration': duration_str,
             'source': 'youtube'
         }
 
@@ -5049,11 +5162,15 @@ async def handle_youtube_playlist_name(update: Update, context: ContextTypes.DEF
 
     if success:
         # Create song entry
+        duration_seconds = youtube_info.get('duration', 0)
+        minutes = duration_seconds // 60
+        seconds = duration_seconds % 60
+        duration_str = f"{minutes}:{seconds:02d}"
         song_entry = {
             'title': video_title,
             'artist': 'YouTube',
             'url': youtube_info['url'],
-            'duration': '0:00',
+            'duration': duration_str,
             'source': 'youtube'
         }
 
@@ -5770,7 +5887,7 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(button_text) > 60:  # Truncate long titles
             button_text = button_text[:57] + "..."
 
-        callback_data = f"show_song_{result['playlist_id']}_{result['song_index']}"
+        callback_data = f"ss_{result['playlist_id']}_{result['song_index']}"
         keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
 
         # Add playlist info to message
