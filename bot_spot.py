@@ -6,7 +6,7 @@ import asyncio
 import random
 import subprocess
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urlparse, parse_qs
 from datetime import datetime, time, timedelta
 from typing import Dict, List, Optional
 
@@ -2782,7 +2782,19 @@ async def perform_youtube_playlist_download(update: Update, context: ContextType
         return
 
     videos, playlist_name, playlist_url = info['songs'], info['name'], info['url']
-    playlist_id = f"youtube_{playlist_url.split('list=')[1]}"
+    
+    try:
+        parsed_url = urlparse(playlist_url)
+        query_params = parse_qs(parsed_url.query)
+        playlist_id_list = query_params.get('list', [])
+        if playlist_id_list:
+            playlist_id = f"youtube_{playlist_id_list[0]}"
+        else:
+            logger.warning(f"Could not find 'list' parameter in YouTube URL: {playlist_url}")
+            playlist_id = f"youtube_fallback_{int(time.time())}"
+    except Exception as e:
+        logger.error(f"Error parsing YouTube playlist URL '{playlist_url}': {e}")
+        playlist_id = f"youtube_error_{int(time.time())}"
 
     playlist_dir = MUSIC_DIR / playlist_name
     playlist_dir.mkdir(exist_ok=True)
@@ -2878,6 +2890,10 @@ async def perform_download(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     songs, playlist_name, playlist_url = info['songs'], info['name'], info['url']
     playlist_id = playlist_url.split('/')[-1].split('?')[0]
+    if not playlist_id:
+        parts = [p for p in playlist_url.split('?')[0].split('/') if p]
+        if parts:
+            playlist_id = parts[-1]
 
     # Use custom name for folder
     playlist_dir = MUSIC_DIR / playlist_name
@@ -2960,6 +2976,9 @@ async def list_playlists(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "📚 *Your Playlists:*\n\n"
 
     for i, (pl_id, data) in enumerate(db.items(), 1):
+        if not pl_id or pl_id.isspace():
+            logger.warning(f"Skipping playlist with invalid ID: '{pl_id}'")
+            continue
         playlist_name = data.get('name', 'Unknown')
         song_count = len(data.get('songs', []))
         playlist_url = data.get('url', '')
@@ -4235,11 +4254,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await download_new_songs(update, context, playlist_id)
     elif data.startswith('delete_song_'):
         # Format: delete_song_{playlist_id}_{song_index}
-        remaining = data.split('delete_song_')[1]
-        # Find the last underscore to get the song_index
-        last_underscore = remaining.rfind('_')
-        playlist_id = remaining[:last_underscore]
-        song_index = int(remaining[last_underscore + 1:])
+        remaining = data.replace('delete_song_', '', 1)
+        parts = remaining.rsplit('_', 1)
+        playlist_id = parts[0]
+        song_index = int(parts[1])
         await delete_song(update, context, playlist_id, song_index)
     elif data.startswith('delete_'):
         playlist_id = data.split('delete_')[1]
@@ -4257,30 +4275,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await list_playlist_songs(update, context, playlist_id)
     elif data.startswith('songs_page_'):
         # Format: songs_page_{playlist_id}_{page}
-        remaining = data.split('songs_page_')[1]
-        # Find the last underscore to get the page number
-        last_underscore = remaining.rfind('_')
-        playlist_id = remaining[:last_underscore]
-        page = int(remaining[last_underscore + 1:])
+        remaining = data.replace('songs_page_', '', 1)
+        parts = remaining.rsplit('_', 1)
+        playlist_id = parts[0]
+        page = int(parts[1])
         await list_playlist_songs(update, context, playlist_id, page)
     elif data.startswith('confirm_delete_playlist_'):
         playlist_id = data.split('confirm_delete_playlist_')[1]
         await confirm_delete_playlist(update, context, playlist_id)
     elif data.startswith('confirm_delete_song_'):
         # Format: confirm_delete_song_{playlist_id}_{song_index}
-        remaining = data.split('confirm_delete_song_')[1]
-        # Find the last underscore to get the song_index
-        last_underscore = remaining.rfind('_')
-        playlist_id = remaining[:last_underscore]
-        song_index = int(remaining[last_underscore + 1:])
+        remaining = data.replace('confirm_delete_song_', '', 1)
+        parts = remaining.rsplit('_', 1)
+        playlist_id = parts[0]
+        song_index = int(parts[1])
         await confirm_delete_song(update, context, playlist_id, song_index)
     elif data.startswith('show_song_'):
         # Format: show_song_{playlist_id}_{song_index}
-        remaining = data.split('show_song_')[1]
-        # Find the last underscore to get the song_index
-        last_underscore = remaining.rfind('_')
-        playlist_id = remaining[:last_underscore]
-        song_index = int(remaining[last_underscore + 1:])
+        remaining = data.replace('show_song_', '', 1)
+        parts = remaining.rsplit('_', 1)
+        playlist_id = parts[0]
+        song_index = int(parts[1])
         await show_song_details(update, context, playlist_id, song_index)
     elif data == 'select_playlist_for_track':
         await show_playlists_for_track(update, context)
