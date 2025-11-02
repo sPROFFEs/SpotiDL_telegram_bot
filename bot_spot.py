@@ -784,6 +784,8 @@ class PlaylistSyncManager:
                 playlist_url = playlist_data.get('url', '')
                 is_custom = playlist_data.get('is_custom', False)
 
+                source = playlist_data.get('source', 'spotify')
+
                 # Skip custom playlists without URL (created from individual tracks)
                 if is_custom or not playlist_url:
                     sync_logger.info(f"Skipping custom playlist without URL: {playlist_name}")
@@ -793,13 +795,22 @@ class PlaylistSyncManager:
 
                 try:
                     # Get current online playlist data
-                    online_data = await self.api_client.get_playlist_details(playlist_url)
-                    if not online_data or 'songs' not in online_data:
-                        sync_logger.warning(f"Could not fetch online data for {playlist_name}")
-                        error_count += 1
-                        continue
+                    if source == 'youtube':
+                        online_data = get_playlist_info(playlist_url)
+                        if not online_data or 'entries' not in online_data:
+                            sync_logger.warning(f"Could not fetch online data for {playlist_name}")
+                            error_count += 1
+                            continue
+                        online_songs_raw = online_data['entries']
+                        online_songs = [{'title': s.get('title', 'Unknown'), 'artist': 'YouTube', 'url': s.get('url'), 'source': 'youtube'} for s in online_songs_raw]
+                    else: # spotify
+                        online_data = await self.api_client.get_playlist_details(playlist_url)
+                        if not online_data or 'songs' not in online_data:
+                            sync_logger.warning(f"Could not fetch online data for {playlist_name}")
+                            error_count += 1
+                            continue
+                        online_songs = online_data['songs']
 
-                    online_songs = online_data['songs']
                     saved_songs = playlist_data.get('songs', [])
 
                     # Find new songs by comparing URLs AND checking if files actually exist
@@ -811,9 +822,13 @@ class PlaylistSyncManager:
                         song_url = song.get('url', '')
                         if song_url:
                             # Check if file actually exists
-                            song_title = sanitize_filename(song.get('title', 'Unknown'))
-                            artist_name = sanitize_filename(song.get('artist', 'Unknown'))
-                            file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
+                            if source == 'youtube':
+                                song_title = sanitize_filename(song.get('title', 'Unknown'))
+                                file_path = playlist_dir / f"{song_title}.mp3"
+                            else:
+                                song_title = sanitize_filename(song.get('title', 'Unknown'))
+                                artist_name = sanitize_filename(song.get('artist', 'Unknown'))
+                                file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
 
                             if file_path.exists():
                                 saved_urls.add(song_url)
@@ -884,26 +899,35 @@ class PlaylistSyncManager:
         playlist_name = playlist_data.get('name', 'Unknown')
         playlist_dir = MUSIC_DIR / playlist_name
         playlist_dir.mkdir(exist_ok=True)
+        source = playlist_data.get('source', 'spotify')
 
         download_logger.info(f"Auto-downloading {len(new_songs)} new songs for {playlist_name}")
         successfully_downloaded_songs = []
 
         for song in new_songs:
             try:
-                song_title = sanitize_filename(song.get('title', 'Unknown'))
-                artist_name = sanitize_filename(song.get('artist', 'Unknown'))
-                file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
+                if source == 'youtube':
+                    song_title = sanitize_filename(song.get('title', 'Unknown'))
+                    file_path = playlist_dir / f"{song_title}.mp3"
+                else:
+                    song_title = sanitize_filename(song.get('title', 'Unknown'))
+                    artist_name = sanitize_filename(song.get('artist', 'Unknown'))
+                    file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
 
                 if file_path.exists():
                     successfully_downloaded_songs.append(song)  # Already exists, count as success
                     continue
 
-                success = await self.api_client.download_song(song, file_path)
+                if source == 'youtube':
+                    success = download_audio_ytdlp(song['url'], str(file_path.with_suffix('')))
+                else:
+                    success = await self.api_client.download_song(song, file_path)
+
                 if success:
-                    download_logger.info(f"Auto-downloaded: {artist_name} - {song_title}")
+                    download_logger.info(f"Auto-downloaded: {song.get('artist', 'YouTube')} - {song.get('title', 'Unknown')}")
                     successfully_downloaded_songs.append(song)  # Only add if successful
                 else:
-                    download_logger.warning(f"Failed to auto-download: {artist_name} - {song_title}")
+                    download_logger.warning(f"Failed to auto-download: {song.get('artist', 'YouTube')} - {song.get('title', 'Unknown')}")
                     # Don't add to successfully_downloaded_songs
 
             except Exception as e:
@@ -2985,10 +3009,12 @@ async def list_playlists(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_custom = data.get('is_custom', False)
 
         # Add playlist header with number for clarity - add indicator for custom playlists
+        source = data.get('source', 'spotify')
+        source_icon = '📺' if source == 'youtube' else '🎵'
         if is_custom:
             text += f"**{i}.** 📁 `{playlist_name}` ({song_count} songs) 🏷️ *Custom*\n"
         else:
-            text += f"**{i}.** 📁 `{playlist_name}` ({song_count} songs)\n"
+            text += f"**{i}.** {source_icon} `{playlist_name}` ({song_count} songs)\n"
 
         # Create first row with primary actions - exclude update for custom playlists
         primary_row = [
@@ -3036,20 +3062,30 @@ async def perform_update(update: Update, context: ContextTypes.DEFAULT_TYPE, pla
     playlist_url = playlist_data.get('url', '')
     is_custom = playlist_data.get('is_custom', False)
 
+    source = playlist_data.get('source', 'spotify')
+
     if is_custom or not playlist_url:
-        await update.callback_query.edit_message_text("❌ Cannot sync custom playlists - they don't have a Spotify URL.")
+        await update.callback_query.edit_message_text("❌ Cannot sync custom playlists - they don't have a URL.")
         return
 
     await update.callback_query.edit_message_text(f"🔄 Updating playlist '{playlist_name}'...")
 
     try:
-        # Get current online playlist data
-        online_data = await api_client.get_playlist_details(playlist_url)
-        if not online_data or 'songs' not in online_data:
-            await update.callback_query.edit_message_text("❌ Could not fetch updated playlist data.")
-            return
+        # Get current online playlist data based on source
+        if source == 'youtube':
+            online_data = get_playlist_info(playlist_url)
+            if not online_data or 'entries' not in online_data:
+                await update.callback_query.edit_message_text("❌ Could not fetch updated YouTube playlist data.")
+                return
+            online_songs_raw = online_data['entries']
+            online_songs = [{'title': s.get('title', 'Unknown'), 'artist': 'YouTube', 'url': s.get('url'), 'source': 'youtube'} for s in online_songs_raw]
+        else:  # spotify
+            online_data = await api_client.get_playlist_details(playlist_url)
+            if not online_data or 'songs' not in online_data:
+                await update.callback_query.edit_message_text("❌ Could not fetch updated Spotify playlist data.")
+                return
+            online_songs = online_data['songs']
 
-        online_songs = online_data['songs']
         saved_songs = playlist_data.get('songs', [])
 
         # Find new songs by comparing URLs AND checking if files actually exist
@@ -3061,9 +3097,13 @@ async def perform_update(update: Update, context: ContextTypes.DEFAULT_TYPE, pla
             song_url = song.get('url', '')
             if song_url:
                 # Check if file actually exists
-                song_title = sanitize_filename(song.get('title', 'Unknown'))
-                artist_name = sanitize_filename(song.get('artist', 'Unknown'))
-                file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
+                if source == 'youtube':
+                    song_title = sanitize_filename(song.get('title', 'Unknown'))
+                    file_path = playlist_dir / f"{song_title}.mp3"
+                else:
+                    song_title = sanitize_filename(song.get('title', 'Unknown'))
+                    artist_name = sanitize_filename(song.get('artist', 'Unknown'))
+                    file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
 
                 if file_path.exists():
                     saved_urls.add(song_url)
@@ -3128,6 +3168,8 @@ async def download_new_songs(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Use the new songs stored from the update process
     new_songs = context.user_data.get(f'new_songs_{playlist_id}', [])
 
+    source = playlist_data.get('source', 'spotify')
+
     try:
         if not new_songs:
             await update.callback_query.edit_message_text(
@@ -3147,9 +3189,13 @@ async def download_new_songs(update: Update, context: ContextTypes.DEFAULT_TYPE,
         successfully_downloaded_songs = []
 
         for i, song in enumerate(new_songs):
-            song_title = sanitize_filename(song.get('title', 'Unknown'))
-            artist_name = sanitize_filename(song.get('artist', 'Unknown'))
-            file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
+            if source == 'youtube':
+                song_title = sanitize_filename(song.get('title', 'Unknown'))
+                file_path = playlist_dir / f"{song_title}.mp3"
+            else:
+                song_title = sanitize_filename(song.get('title', 'Unknown'))
+                artist_name = sanitize_filename(song.get('artist', 'Unknown'))
+                file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
 
             if file_path.exists():
                 downloaded_count += 1
@@ -3165,7 +3211,10 @@ async def download_new_songs(update: Update, context: ContextTypes.DEFAULT_TYPE,
             # Try to download with retries
             success = False
             for attempt in range(MAX_DOWNLOAD_ATTEMPTS):
-                success = await api_client.download_song(song, file_path)
+                if source == 'youtube':
+                    success = download_audio_ytdlp(song['url'], str(file_path.with_suffix('')))
+                else:
+                    success = await api_client.download_song(song, file_path)
                 if success:
                     break
                 if attempt < MAX_DOWNLOAD_ATTEMPTS - 1:  # Only sleep if not the last attempt
@@ -3621,20 +3670,30 @@ async def resync_individual_playlist(update: Update, context: ContextTypes.DEFAU
     playlist_url = playlist_data.get('url', '')
     is_custom = playlist_data.get('is_custom', False)
 
+    source = playlist_data.get('source', 'spotify')
+
     if is_custom or not playlist_url:
-        await update.callback_query.edit_message_text("❌ Cannot sync custom playlists - they don't have a Spotify URL.")
+        await update.callback_query.edit_message_text("❌ Cannot sync custom playlists - they don't have a URL.")
         return
 
     await update.callback_query.edit_message_text(f"🔄 Syncing playlist '{playlist_name}'...")
 
     try:
         # Get current online playlist data
-        online_data = await api_client.get_playlist_details(playlist_url)
-        if not online_data or 'songs' not in online_data:
-            await update.callback_query.edit_message_text("❌ Could not fetch updated playlist data.")
-            return
+        if source == 'youtube':
+            online_data = get_playlist_info(playlist_url)
+            if not online_data or 'entries' not in online_data:
+                await update.callback_query.edit_message_text("❌ Could not fetch updated YouTube playlist data.")
+                return
+            online_songs_raw = online_data['entries']
+            online_songs = [{'title': s.get('title', 'Unknown'), 'artist': 'YouTube', 'url': s.get('url'), 'source': 'youtube'} for s in online_songs_raw]
+        else: # spotify
+            online_data = await api_client.get_playlist_details(playlist_url)
+            if not online_data or 'songs' not in online_data:
+                await update.callback_query.edit_message_text("❌ Could not fetch updated playlist data.")
+                return
+            online_songs = online_data['songs']
 
-        online_songs = online_data['songs']
         saved_songs = playlist_data.get('songs', [])
 
         # Find new songs by comparing URLs AND checking if files actually exist
@@ -3646,9 +3705,13 @@ async def resync_individual_playlist(update: Update, context: ContextTypes.DEFAU
             song_url = song.get('url', '')
             if song_url:
                 # Check if file actually exists
-                song_title = sanitize_filename(song.get('title', 'Unknown'))
-                artist_name = sanitize_filename(song.get('artist', 'Unknown'))
-                file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
+                if source == 'youtube':
+                    song_title = sanitize_filename(song.get('title', 'Unknown'))
+                    file_path = playlist_dir / f"{song_title}.mp3"
+                else:
+                    song_title = sanitize_filename(song.get('title', 'Unknown'))
+                    artist_name = sanitize_filename(song.get('artist', 'Unknown'))
+                    file_path = playlist_dir / f"{artist_name} - {song_title}.mp3"
 
                 if file_path.exists():
                     saved_urls.add(song_url)
