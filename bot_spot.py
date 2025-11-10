@@ -5,6 +5,7 @@ import logging
 import asyncio
 import random
 import subprocess
+import aiohttp
 from pathlib import Path
 from urllib.parse import quote, urlparse, parse_qs
 from datetime import datetime, time, timedelta
@@ -2421,117 +2422,168 @@ class SpotDownAPI:
             return None
 
     async def _download_with_session(self, song_url: str, download_path: Path, song_title: str) -> bool:
-        """Download song using the established session (Step 2 of the flow) - with proxy fallback"""
+        """Download song using direct HTTP POST request (optimized approach)
+        
+        Flow based on actual SpotDown.app behavior:
+        1. POST /api/download with {url: spotify_url}
+        2. Response is raw audio/mpeg MP3 file
+        3. Save directly to disk
+        """
         try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(**self.BROWSER_LAUNCH_OPTIONS)
+            # Prepare headers exactly like browser does
+            headers = {
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.5",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Content-Type": "application/json",
+                "Origin": "https://spotdown.org",
+                "Referer": "https://spotdown.org/track",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+                "DNT": "1",
+                "Sec-GPC": "1",
+                "Priority": "u=1, i"
+            }
 
-                # Enhanced browser headers matching Firefox from your capture
-                browser_headers = {
-                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:142.0) Gecko/20100101 Firefox/142.0",
-                    "Accept-Language": "en-US,en;q=0.5",
-                    "DNT": "1",
-                    "Sec-GPC": "1",
-                }
+            payload = {"url": song_url}
+            api_url = f"{self.current_base_url}/api/download"
 
-                context = await browser.new_context(
-                    extra_http_headers=browser_headers,
-                    ignore_https_errors=True,
-                    java_script_enabled=True,
-                    bypass_csp=True
-                )
-                page = await context.new_page()
+            download_logger.debug(f"🌐 Downloading from: {api_url}")
+            download_logger.debug(f"📤 Payload: {payload}")
 
-                try:
-                    # Visit main page to establish session
-                    await page.goto(f"{self.BASE_URL}/", wait_until="domcontentloaded", timeout=30000)
+            timeout = aiohttp.ClientTimeout(total=120)  # 2 minutes timeout
+            
+            # Use proxy if configured and we've had failures
+            proxy = None
+            if self._should_use_proxy_immediately():
+                proxy = await self.proxy_manager.get_working_proxy(context=None)
+                if proxy:
+                    download_logger.info(f"🔄 Using proxy: {proxy}")
 
-                    # Simulate human behavior
-                    await page.mouse.move(random.randint(100, 800), random.randint(100, 600))
-                    await page.wait_for_timeout(random.randint(2000, 4000))
-
-                    # Prepare download request headers (exactly like browser)
-                    download_headers = {
-                        "Accept": "application/json, text/plain, */*",
-                        "Accept-Language": "en-US,en;q=0.5",
-                        "Accept-Encoding": "gzip, deflate, br",
-                        "Referer": "https://spotdown.app/",
-                        "Content-Type": "application/json",
-                        "Origin": "https://spotdown.app",
-                        "Sec-Fetch-Dest": "empty",
-                        "Sec-Fetch-Mode": "cors",
-                        "Sec-Fetch-Site": "same-origin",
-                        "DNT": "1",
-                        "Sec-GPC": "1",
-                        "Priority": "u=0",
-                        "Te": "trailers"
-                    }
-
-                    # Make download request
-                    payload = {"url": song_url}
-                    api_url = f"{self.BASE_URL}/api/download"
-
-                    download_logger.debug(f"Making download request to {api_url} with payload: {payload}")
-
-                    response = await page.request.post(
-                        api_url,
-                        data=json.dumps(payload),
-                        headers=download_headers,
-                        timeout=120000  # 2 minutes timeout
-                    )
-
-                    if response.ok:
-                        content = await response.body()
-                        content_type = response.headers.get('content-type', '').lower()
-
-                        # Check if response is JSON error message (like your 500 error example)
-                        if 'application/json' in content_type:
-                            try:
-                                json_response = json.loads(content.decode('utf-8'))
-                                if not json_response.get('success', True):
-                                    error_msg = json_response.get('message', 'Unknown error')
-                                    download_logger.warning(f"API returned error: {error_msg}")
-                                    return False
-                            except json.JSONDecodeError:
-                                pass  # Not valid JSON, continue with audio validation
-
-                        # Validate audio content
-                        if len(content) > 1000:
-                            if ('audio' in content_type or 'octet-stream' in content_type or
-                                len(content) > 100000 or content.startswith(b'ID3')):
-                                with open(download_path, 'wb') as f:
-                                    f.write(content)
-                                download_logger.info(f"✅ Download successful (Size: {len(content)} bytes, Type: {content_type})")
-                                return True
-                            else:
-                                download_logger.warning(f"Invalid content type: {content_type}, size: {len(content)} bytes")
-                                download_logger.debug(f"Content starts with: {content[:50]}")
-                                return False
-                        else:
-                            download_logger.warning(f"Response too small ({len(content)} bytes)")
-                            try:
-                                response_text = content.decode('utf-8')[:200]
-                                download_logger.debug(f"Small response content: {response_text}")
-                            except:
-                                pass
-                            return False
-                    else:
-                        download_logger.warning(f"Download request failed (Status: {response.status})")
-                        try:
-                            response_text = await response.text()
-                            download_logger.debug(f"Error response: {response_text[:500]}")
-                        except:
-                            pass
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(
+                    api_url,
+                    json=payload,
+                    headers=headers,
+                    ssl=False,
+                    proxy=proxy
+                ) as response:
+                    # Check response status
+                    if response.status != 200:
+                        error_text = await response.text()
+                        download_logger.warning(f"❌ API returned status {response.status}")
+                        download_logger.debug(f"Response: {error_text[:500]}")
                         return False
 
-                except Exception as e:
-                    download_logger.error(f"Download request exception: {e}")
+                    # Read response content
+                    content = await response.read()
+                    content_type = response.headers.get('content-type', '').lower()
+
+                    download_logger.debug(f"📥 Response size: {len(content)} bytes, Type: {content_type}")
+
+                    # Check for JSON error response
+                    if 'application/json' in content_type:
+                        try:
+                            error_data = json.loads(content.decode('utf-8'))
+                            error_msg = error_data.get('message', error_data.get('error', 'Unknown error'))
+                            download_logger.warning(f"⚠️  API returned error: {error_msg}")
+                            return False
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            # Not JSON, might be audio data, continue
+                            pass
+
+                    # Validate audio content
+                    return await self._validate_and_save_audio(content, content_type, download_path, song_title)
+
+        except aiohttp.ClientError as e:
+            download_logger.warning(f"HTTP client error: {e}")
+            return False
+        except asyncio.TimeoutError:
+            download_logger.warning(f"Download timeout for {song_title}")
+            return False
+        except Exception as e:
+            download_logger.error(f"Download failed: {e}")
+            download_logger.debug(f"Exception type: {type(e).__name__}, Details: {str(e)}")
+            return False
+
+    async def _validate_and_save_audio(self, content: bytes, content_type: str, download_path: Path, song_title: str) -> bool:
+        """Validate audio content and save to disk
+        
+        Validation checks:
+        - Minimum size (MP3 files should be > 1KB)
+        - Valid audio/mpeg content type OR
+        - Starts with MP3 frame marker (ID3 or 0xFF)
+        - Size > 100KB (typical MP3 requirements)
+        """
+        try:
+            # Check minimum size
+            if len(content) < 1000:
+                download_logger.warning(f"⚠️  Response too small ({len(content)} bytes) - likely not an audio file")
+                try:
+                    text_content = content.decode('utf-8', errors='ignore')[:200]
+                    if text_content:
+                        download_logger.debug(f"Response content: {text_content}")
+                except:
+                    pass
+                return False
+
+            # Validate audio signature
+            is_valid_mp3 = False
+            
+            # Check content type
+            if 'audio' in content_type or 'octet-stream' in content_type:
+                is_valid_mp3 = True
+                download_logger.debug(f"✅ Valid content type: {content_type}")
+
+            # Check MP3 signature (ID3 tag or frame sync)
+            if content.startswith(b'ID3'):  # ID3v2 tag
+                is_valid_mp3 = True
+                download_logger.debug(f"✅ ID3 tag detected")
+            elif len(content) > 2 and content[0:2] == b'\xff\xfb':  # MPEG Layer 3 sync
+                is_valid_mp3 = True
+                download_logger.debug(f"✅ MP3 frame sync detected")
+            elif len(content) > 2 and content[0] == 0xff and (content[1] & 0xe0) == 0xe0:  # Alternative MPEG sync
+                is_valid_mp3 = True
+                download_logger.debug(f"✅ MPEG frame sync detected")
+
+            # Check size (most MP3s are > 100KB)
+            if len(content) > 100000:
+                is_valid_mp3 = True
+                download_logger.debug(f"✅ File size reasonable ({len(content)} bytes)")
+
+            if not is_valid_mp3:
+                download_logger.warning(f"⚠️  Content validation failed - may not be valid audio")
+                download_logger.debug(f"Content type: {content_type}, Size: {len(content)}, First bytes: {content[:20].hex()}")
+                
+                # But try to save anyway if size is reasonable
+                if len(content) > 10000:
+                    download_logger.info(f"ℹ️  Attempting to save despite validation concerns...")
+                else:
                     return False
-                finally:
-                    await browser.close()
+
+            # Save to disk
+            try:
+                download_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(download_path, 'wb') as f:
+                    f.write(content)
+                
+                # Verify file was written
+                if download_path.exists():
+                    actual_size = download_path.stat().st_size
+                    download_logger.info(f"✅ Successfully saved {song_title} ({actual_size} bytes)")
+                    return True
+                else:
+                    download_logger.error(f"❌ File was not created at {download_path}")
+                    return False
+
+            except IOError as e:
+                download_logger.error(f"❌ Failed to write file: {e}")
+                return False
 
         except Exception as e:
-            download_logger.error(f"Session download failed: {e}")
+            download_logger.error(f"❌ Audio validation failed: {e}")
             return False
 
 
@@ -2609,39 +2661,76 @@ class SpotDownAPI:
             return False
 
     async def _try_spotdown(self, song_url: str, song_title: str, download_path: Path) -> bool:
-        """Try SpotDown API method"""
+        """Try SpotDown API method with improved error handling and fallback domains
+        
+        Flow:
+        1. Get song details first (validates URL and gets metadata)
+        2. Download song using optimized HTTP method
+        3. Implement retry logic with exponential backoff
+        """
+        # SpotDown domains to try (in order of preference)
+        domains_to_try = [
+            "https://spotdown.org",
+            "https://spotdown.app",
+            "https://spot-down.com",
+        ]
+        
         download_logger.info(f"🌐 Trying SpotDown API for: {song_title}")
+        
+        for domain_idx, base_domain in enumerate(domains_to_try):
+            download_logger.debug(f"🔄 Trying domain ({domain_idx + 1}/{len(domains_to_try)}): {base_domain}")
+            self.current_base_url = base_domain
+            
+            for attempt in range(MAX_API_ATTEMPTS):
+                try:
+                    await self._rate_limit()
+                    attempt_num = attempt + 1
+                    download_logger.info(f"SpotDown attempt {attempt_num}/{MAX_API_ATTEMPTS} for: {song_title} on {base_domain}")
 
-        for attempt in range(MAX_API_ATTEMPTS):
-            try:
-                await self._rate_limit()
-                download_logger.info(f"SpotDown attempt {attempt + 1}/{MAX_API_ATTEMPTS} for: {song_title}")
+                    # Step 1: Get song details to validate URL
+                    try:
+                        song_details = await self.get_song_details(song_url)
+                        if not song_details:
+                            download_logger.debug(f"Failed to get song details - trying next domain")
+                            await self._handle_api_failure()
+                            break  # Try next domain
+                    except Exception as detail_error:
+                        download_logger.debug(f"Song details error: {detail_error}")
+                        await self._handle_api_failure()
+                        break  # Try next domain
 
-                song_details = await self.get_song_details(song_url)
-                if not song_details:
-                    download_logger.warning(f"Failed to get song details on attempt {attempt + 1}")
+                    # Step 2: Download the actual song
+                    success = await self._download_with_session(song_url, download_path, song_title)
+                    if success:
+                        download_logger.info(f"✅ Successfully downloaded {song_title} using SpotDown from {base_domain}")
+                        if self.failed_requests > 0:
+                            self.failed_requests = max(0, self.failed_requests - 1)
+                        self.current_base_url = self.BASE_URL  # Reset to default
+                        return True
+
+                    # Step 2 failed, log and handle
+                    download_logger.warning(f"Download failed on attempt {attempt_num}")
                     await self._handle_api_failure()
-                    continue
 
-                success = await self._download_with_session(song_url, download_path, song_title)
-                if success:
-                    download_logger.info(f"✅ Successfully downloaded {song_title} using SpotDown on attempt {attempt + 1}")
-                    if self.failed_requests > 0:
-                        self.failed_requests = max(0, self.failed_requests - 1)
-                    return True
+                except asyncio.TimeoutError:
+                    download_logger.warning(f"Timeout on attempt {attempt + 1} with domain {base_domain}")
+                    await self._handle_api_failure()
+                except Exception as e:
+                    download_logger.warning(f"SpotDown attempt {attempt + 1} error: {e}")
+                    await self._handle_api_failure()
 
-                await self._handle_api_failure()
+                # Implement exponential backoff between retries
+                if attempt < MAX_API_ATTEMPTS - 1:
+                    delay = RETRY_DELAY_SECONDS * (2 ** attempt) + random.uniform(1, 3)
+                    download_logger.info(f"⏳ Waiting {delay:.1f}s before retry...")
+                    await asyncio.sleep(delay)
+            
+            # If we exhausted attempts for this domain, try next one
+            download_logger.debug(f"Exhausted attempts for domain {base_domain}, trying next...")
 
-            except Exception as e:
-                download_logger.warning(f"SpotDown attempt {attempt + 1} failed: {e}")
-                await self._handle_api_failure()
-
-            if attempt < MAX_API_ATTEMPTS - 1:
-                delay = RETRY_DELAY_SECONDS * (2 ** attempt) + random.uniform(1, 3)
-                download_logger.info(f"Waiting {delay:.1f}s before retry...")
-                await asyncio.sleep(delay)
-
-        download_logger.warning(f"SpotDown method failed for: {song_title}")
+        # Reset to default domain
+        self.current_base_url = self.BASE_URL
+        download_logger.warning(f"❌ SpotDown method failed for: {song_title} after trying all domains")
         return False
 
     async def download_song(self, song_url_or_data, download_path: Path):
